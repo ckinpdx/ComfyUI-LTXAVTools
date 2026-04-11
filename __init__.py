@@ -1,9 +1,8 @@
 from .nodes.audio_latent import NODE_CLASS_MAPPINGS as _ACM, NODE_DISPLAY_NAME_MAPPINGS as _ADM
-from .nodes.extend_mask import NODE_CLASS_MAPPINGS as _ECM, NODE_DISPLAY_NAME_MAPPINGS as _EDM
 from .nodes.calculators import NODE_CLASS_MAPPINGS as _CCM, NODE_DISPLAY_NAME_MAPPINGS as _CDM
 
-NODE_CLASS_MAPPINGS = {**_ACM, **_ECM, **_CCM}
-NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_EDM, **_CDM}
+NODE_CLASS_MAPPINGS = {**_ACM, **_CCM}
+NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM}
 
 WEB_DIRECTORY = "./web/js"
 
