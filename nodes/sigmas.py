@@ -4,11 +4,15 @@ import torch
 
 class LTXDetailSigmas:
     """
-    Generates a sigma schedule following the 'high-cluster + cliff + power-tail' principle.
+    Generates a sigma schedule for LTX distilled models using a
+    high-cluster + cliff + power-tail structure.
+
+    Designed specifically for distilled or heavily distill-LoRA weighted models
+    that have a learned shortcut at mid-sigma. Not suitable for full dev model runs.
 
     Divides steps into three regions:
-      1. High cluster  — linear steps near sigma=1.0 for fine structure establishment
-      2. Cliff         — single large step to cliff_sigma (distilled model shortcut)
+      1. High cluster  — dense linear steps near sigma=1.0 (structure establishment)
+      2. Cliff         — single large step exploiting the distilled model's learned shortcut
       3. Tail          — power curve from cliff_sigma down to 0.0
 
     At 8 steps with defaults this approximates the known community schedule:
@@ -73,5 +77,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LTXDetailSigmas": "LTX Detail Sigmas",
+    "LTXDetailSigmas": "LTX Distilled Sigmas",
 }

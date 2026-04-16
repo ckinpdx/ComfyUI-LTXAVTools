@@ -63,8 +63,8 @@ Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` f
 
 ---
 
-### LTX Detail Sigmas
-Generates a sigma schedule using a high-cluster + cliff + power-tail structure, designed for LTX distilled models. Concentrates steps near sigma=1.0 for fine detail establishment, then uses a single large cliff step (the distilled shortcut), followed by a power-curve tail to zero.
+### LTX Distilled Sigmas
+Generates a sigma schedule for **distilled or heavily distill-LoRA weighted LTX models** using a high-cluster + cliff + power-tail structure. Not suitable for full dev model runs. Concentrates steps near sigma=1.0, then uses a single large cliff step exploiting the distilled model's learned shortcut, followed by a power-curve tail to zero.
 
 At 8 steps with defaults approximates the known community schedule: `1.0 → ~0.975 (linear cluster) → 0.65 (cliff) → ~0.0 (power tail)`.
 
@@ -75,5 +75,17 @@ At 8 steps with defaults approximates the known community schedule: `1.0 → ~0.
 | `cluster_width` | 0.025 | Sigma range of cluster (1.0 down to 1.0 − width) |
 | `cliff_sigma` | 0.65 | Landing sigma after the cliff step |
 | `tail_power` | 2.0 | Power curve exponent for tail (higher = more steps near cliff) |
+
+**Output:** `SIGMAS`
+
+---
+
+### LTX Sigma Resample
+Resamples a sigma schedule to a different step count while preserving its essential character — cliff positions, cluster density, tail shape. Extracts the f(σ) phase portrait from the source schedule and integrates forward at the new step count. Chain from the same sigma source with different `steps` inputs to produce multiple step-count variants.
+
+| Input | Description |
+|---|---|
+| `sigmas` | Source sigma schedule |
+| `steps` | Number of steps for the output schedule |
 
 **Output:** `SIGMAS`

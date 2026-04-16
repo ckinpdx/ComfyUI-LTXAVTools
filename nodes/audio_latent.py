@@ -1,4 +1,70 @@
+import math
+
 import torch
+import comfy.model_management
+from comfy.nested_tensor import NestedTensor
+
+
+_LTX_VIDEO_LATENT_CHANNELS = 128
+_LTX_MIN_VIDEO_SPATIAL = 4  # latent space (= 32px), safe minimum for patchifier
+
+
+class LTXAudioOnlyLatent:
+    """
+    Creates a combined AV latent for audio-only generation.
+    Pairs a minimal dummy video latent with a zero audio latent of the desired duration,
+    wrapped as a NestedTensor ready for the LTX2 AV sampler.
+
+    Wire the output latent into LTXVAudioVideoMask using audio_latent_frames to
+    set up the denoising mask before sampling.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_vae": ("VAE",),
+                "seconds": ("FLOAT", {
+                    "default": 3.0, "min": 0.1, "max": 300.0, "step": 0.1,
+                    "tooltip": "Audio duration in seconds.",
+                }),
+                "batch_size": ("INT", {
+                    "default": 1, "min": 1, "max": 16, "step": 1,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "INT")
+    RETURN_NAMES = ("latent", "audio_latent_frames")
+    FUNCTION = "create"
+    CATEGORY = "LTXAVTools/audio"
+
+    def create(self, audio_vae, seconds, batch_size):
+        device = comfy.model_management.intermediate_device()
+
+        z_channels = audio_vae.latent_channels
+        freq_bins = audio_vae.latent_frequency_bins
+        latents_per_second = audio_vae.latents_per_second
+
+        num_audio_latents = math.ceil(seconds * latents_per_second)
+
+        video = torch.zeros(
+            (batch_size, _LTX_VIDEO_LATENT_CHANNELS, 1, _LTX_MIN_VIDEO_SPATIAL, _LTX_MIN_VIDEO_SPATIAL),
+            device=device,
+        )
+        audio = torch.zeros(
+            (batch_size, z_channels, num_audio_latents, freq_bins),
+            device=device,
+        )
+
+        print(f"[LTXAudioOnlyLatent] audio: {audio.shape} | video dummy: {video.shape}")
+
+        latent = {
+            "samples": NestedTensor([video, audio]),
+            "type": "ltxv",
+        }
+
+        return (latent, num_audio_latents)
 
 
 class LTXAudioLatentTrim:
@@ -78,9 +144,11 @@ class LatentStripMask:
 NODE_CLASS_MAPPINGS = {
     "LTXAudioLatentTrim": LTXAudioLatentTrim,
     "LatentStripMask": LatentStripMask,
+    "LTXAudioOnlyLatent": LTXAudioOnlyLatent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXAudioLatentTrim": "LTX Audio Latent Trim",
     "LatentStripMask": "Latent Strip Mask",
+    "LTXAudioOnlyLatent": "LTX Audio Only Latent",
 }
