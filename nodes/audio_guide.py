@@ -56,10 +56,45 @@ class LTXVAddAudioLatentGuide:
         return (positive, negative)
 
 
+class LTXVCropAudioGuide:
+    """
+    Strips ref_audio from conditioning after sampling.
+    Matches LTXVAddAudioLatentGuide — call this after SamplerCustomAdvanced
+    to clean up the conditioning for any subsequent passes or nodes.
+    No latent trimming needed (audio guides don't append tokens to the latent).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "crop"
+    CATEGORY = "LTXAVTools/audio"
+    DESCRIPTION = (
+        "Removes ref_audio from conditioning after sampling. "
+        "Use after SamplerCustomAdvanced when LTXVAddAudioLatentGuide was used, "
+        "to prevent stale audio guide from affecting subsequent passes."
+    )
+
+    def crop(self, positive, negative):
+        positive = node_helpers.conditioning_set_values(positive, {"ref_audio": None})
+        negative = node_helpers.conditioning_set_values(negative, {"ref_audio": None})
+        return (positive, negative)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXVAddAudioLatentGuide": LTXVAddAudioLatentGuide,
+    "LTXVCropAudioGuide": LTXVCropAudioGuide,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXVAddAudioLatentGuide": "LTX Add Audio Latent Guide",
+    "LTXVCropAudioGuide": "LTX Crop Audio Guide",
 }

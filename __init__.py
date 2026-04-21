@@ -4,9 +4,10 @@ from .nodes.audio_guide import NODE_CLASS_MAPPINGS as _AGM, NODE_DISPLAY_NAME_MA
 from .nodes.sigmas import NODE_CLASS_MAPPINGS as _SCM, NODE_DISPLAY_NAME_MAPPINGS as _SDM
 from .nodes.sigma_character import NODE_CLASS_MAPPINGS as _SCCM, NODE_DISPLAY_NAME_MAPPINGS as _SCDM
 from .nodes.utils import NODE_CLASS_MAPPINGS as _UCM, NODE_DISPLAY_NAME_MAPPINGS as _UDM
+from .nodes.av_looping_sampler import NODE_CLASS_MAPPINGS as _ALSCM, NODE_DISPLAY_NAME_MAPPINGS as _ALSDM
 
-NODE_CLASS_MAPPINGS = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM}
-NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM}
+NODE_CLASS_MAPPINGS = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM}
+NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM}
 
 WEB_DIRECTORY = "./web/js"
 
