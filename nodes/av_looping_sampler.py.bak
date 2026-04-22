@@ -27,7 +27,6 @@ from comfy_extras.nodes_lt import (
     EmptyLTXVLatentVideo,
     LTXVAddGuide,
     LTXVCropGuides,
-    _append_guide_attention_entry,
     get_noise_mask,
 )
 
@@ -69,34 +68,6 @@ def _select_video_frames(latent_dict, start, end):
     if "noise_mask" in s and s["noise_mask"] is not None:
         s["noise_mask"] = s["noise_mask"][:, :, si:ei + 1]
     return s
-
-
-def _apply_adain(video_out, adain_ref, factor, per_frame=False):
-    """
-    Normalize video_out channel statistics to match adain_ref, then lerp.
-    video_out / adain_ref: [B, C, T, H, W]
-    factor=0.0 → no change; factor=1.0 → full normalization.
-    per_frame=False → normalize per-channel globally (uses first chunk as ref).
-    per_frame=True  → normalize per-frame per-channel (uses normalizing_latents).
-    """
-    if factor == 0.0:
-        return video_out
-    t = video_out.clone()
-    for b in range(t.shape[0]):
-        for c in range(t.shape[1]):
-            if not per_frame:
-                r_sd, r_mean = torch.std_mean(adain_ref[b, c], dim=None)
-                i_sd, i_mean = torch.std_mean(t[b, c], dim=None)
-                if i_sd > 1e-8:
-                    t[b, c] = ((t[b, c] - i_mean) / i_sd) * r_sd + r_mean
-            else:
-                for f in range(t.shape[2]):
-                    rf = min(f, adain_ref.shape[2] - 1)
-                    r_sd, r_mean = torch.std_mean(adain_ref[b, c, rf], dim=None)
-                    i_sd, i_mean = torch.std_mean(t[b, c, f], dim=None)
-                    if i_sd > 1e-8:
-                        t[b, c, f] = ((t[b, c, f] - i_mean) / i_sd) * r_sd + r_mean
-    return torch.lerp(video_out, t, factor)
 
 
 def _linear_overlap_blend(t1, t2, overlap, axis=2):
@@ -259,13 +230,6 @@ class LTXVAVLoopingSampler:
             scale_factors=ts,
             guide_mask=guide_mask,
         )
-        # Register a guide_attention_entry so all guides (overlap + image keyframes)
-        # are consistent. Without this, mixing append_keyframe and LTXVAddGuide.execute
-        # in the same chunk produces a pre_filter_counts / kf_grid_mask mismatch.
-        pre_filter_count = guide.shape[2] * guide.shape[3] * guide.shape[4]
-        positive, negative = _append_guide_attention_entry(
-            positive, negative, pre_filter_count, list(guide.shape[2:]), strength,
-        )
         return positive, negative, {"samples": latent_tensor, "noise_mask": noise_mask}
 
     def _build_av_noise_mask(self, video_latent_dict, audio_mask_tensor, ltxav):
@@ -382,7 +346,6 @@ class LTXVAVLoopingSampler:
         guiding_latents, guiding_strength,
         keyframes, kf_idx_str,
         audio_cond_strength=0.0,
-        adain_factor=0.0, adain_ref=None, adain_per_frame=False,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -473,8 +436,6 @@ class LTXVAVLoopingSampler:
         video_out, audio_out, pos_out, neg_out = self._crop_and_split(
             av_out, positive, negative, ltxav
         )
-        if adain_ref is not None and adain_factor > 0.0:
-            video_out = _apply_adain(video_out, adain_ref, adain_factor, adain_per_frame)
         return {"samples": video_out}, audio_out
 
     # ------------------------------------------------------------------ #
@@ -497,7 +458,6 @@ class LTXVAVLoopingSampler:
         keyframes, kf_idx_str, cond_image_strength,
         chunk_index,
         audio_cond_strength=0.0,
-        adain_factor=0.0, adain_ref=None, adain_per_frame=False,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -599,9 +559,6 @@ class LTXVAVLoopingSampler:
 
         video_out, audio_out, _, _ = self._crop_and_split(av_out, positive, negative, ltxav)
 
-        if adain_ref is not None and adain_factor > 0.0:
-            video_out = _apply_adain(video_out, adain_ref, adain_factor, adain_per_frame)
-
         # --- stitch video ---
         # drop local frame 0 (1 px stub from first-frame treatment)
         video_trimmed = video_out[:, :, 1:]
@@ -651,15 +608,12 @@ class LTXVAVLoopingSampler:
         first_seed, v, h, vert_tiles, horiz_tiles,
         per_tile_seed_offsets,
         audio_cond_strength=0.0,
-        adain_factor=0.0, normalizing_latents=None,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         step = temporal_tile_size - temporal_overlap
-        video_acc    = None
-        audio_acc    = None
-        chunk_idx    = 0
-        adain_ref    = None   # set after first chunk; used as fallback when no normalizing_latents
-        adain_per_frame = normalizing_latents is not None
+        video_acc = None
+        audio_acc = None
+        chunk_idx = 0
 
         starts = range(0, T_v + step, step)
         ends   = range(temporal_tile_size, T_v + temporal_tile_size, step)
@@ -703,33 +657,14 @@ class LTXVAVLoopingSampler:
                 guiding_latents=guiding_latents, guiding_strength=guiding_strength,
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
                 audio_cond_strength=audio_cond_strength,
-                adain_factor=adain_factor,
             )
-
-            # Build AdaIN reference for this chunk
-            if adain_factor > 0.0:
-                if normalizing_latents is not None:
-                    # Per-frame reference: slice normalizing latents to chunk window
-                    nl = normalizing_latents["samples"]
-                    nl_start = min(v_start, nl.shape[2] - 1)
-                    nl_end   = min(v_end,   nl.shape[2])
-                    chunk_adain_ref = nl[:, :, nl_start:nl_end]
-                else:
-                    # Fall back to first chunk output (per-channel global)
-                    chunk_adain_ref = adain_ref
-            else:
-                chunk_adain_ref = None
 
             if v_start == 0:
                 video_acc, audio_acc = self._sample_first_chunk(
                     **shared,
                     temporal_tile_size=temporal_tile_size,
                     cond_images=cond_images, cond_image_strength=cond_image_strength,
-                    adain_ref=chunk_adain_ref, adain_per_frame=adain_per_frame,
                 )
-                # Store first chunk output as fallback reference
-                if adain_factor > 0.0 and normalizing_latents is None:
-                    adain_ref = video_acc["samples"].detach()
             else:
                 video_acc, audio_acc = self._sample_extend_chunk(
                     **shared,
@@ -741,7 +676,6 @@ class LTXVAVLoopingSampler:
                     audio_overlap_cond_strength=audio_overlap_cond_strength,
                     cond_image_strength=cond_image_strength,
                     chunk_index=chunk_idx,
-                    adain_ref=chunk_adain_ref, adain_per_frame=adain_per_frame,
                 )
             chunk_idx += 1
 
@@ -858,11 +792,6 @@ class LTXVAVLoopingSampler:
                         :,
                     ]
 
-                tile_norm = None
-                if optional_normalizing_latents is not None:
-                    n = optional_normalizing_latents["samples"]
-                    tile_norm = {"samples": n[:, :, :, vs:ve, hs:he]}
-
                 tile_video_out, tile_audio_out = self._process_temporal_chunks(
                     model=model, vae=vae, noise=noise,
                     sampler=sampler, sigmas=sigmas, guider=guider,
@@ -892,8 +821,6 @@ class LTXVAVLoopingSampler:
                     v=v, h=h,
                     vert_tiles=vertical_tiles, horiz_tiles=horizontal_tiles,
                     per_tile_seed_offsets=per_tile_seed_offsets_list,
-                    adain_factor=adain_factor,
-                    normalizing_latents=tile_norm,
                 )
 
                 # accumulate video with spatial weights
