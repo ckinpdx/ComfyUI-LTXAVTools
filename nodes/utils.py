@@ -3,6 +3,7 @@ import uuid
 import numpy as np
 import torch
 import folder_paths
+from comfy import model_management
 from PIL import Image
 
 try:
@@ -183,16 +184,207 @@ class LTXAudioLatentPad:
         return (out,)
 
 
+class LTXVAVLatentUpsampler:
+    """
+    AV-aware wrapper around the LTX latent upscale model with CPU fallback.
+
+    The LTX upsampler uses Conv3d + GroupNorm throughout. GroupNorm normalises
+    across T×H×W jointly, so temporal chunking changes the statistics and
+    causes seam artefacts regardless of overlap size. The full tensor must be
+    processed at once. This node tries GPU first; if it OOMs it retries on CPU.
+
+    Handles both plain video latents [B, C, T, H, W] and AV NestedTensors —
+    only the video component is upsampled; audio passes through unchanged.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples":       ("LATENT",),
+                "upscale_model": ("LATENT_UPSCALE_MODEL",),
+                "vae":           ("VAE",),
+            }
+        }
+
+    RETURN_TYPES  = ("LATENT",)
+    FUNCTION      = "upsample_latent"
+    CATEGORY      = "LTXAVTools/utils"
+
+    def upsample_latent(self, samples, upscale_model, vae):
+        raw   = samples["samples"]
+        is_av = _HAS_NESTED and isinstance(raw, NestedTensor)
+
+        if is_av:
+            video = raw.tensors[0]   # [B, C, T, H, W]
+            audio = raw.tensors[1]   # passed through unchanged
+        else:
+            video = raw
+            audio = None
+
+        stats       = vae.first_stage_model.per_channel_statistics
+        model_dtype = next(upscale_model.parameters()).dtype
+        input_dtype = video.dtype
+
+        video_un = stats.un_normalize(video).to(dtype=model_dtype)
+        print(f"[LTXVLatentUpsamplerTiled] input {tuple(video_un.shape)}")
+
+        device = model_management.get_torch_device()
+        upscale_model.to(device)
+        try:
+            upsampled = upscale_model(video_un.to(device))
+        except torch.cuda.OutOfMemoryError:
+            print(
+                "[LTXVLatentUpsamplerTiled] GPU OOM — retrying on CPU (this will be slow)."
+            )
+            upscale_model.cpu()
+            upsampled = upscale_model(video_un.cpu())
+        finally:
+            upscale_model.cpu()
+
+        upsampled = stats.normalize(upsampled).to(
+            dtype=input_dtype,
+            device=model_management.intermediate_device(),
+        )
+
+        out = samples.copy()
+        out.pop("noise_mask", None)
+
+        if is_av:
+            out["samples"] = NestedTensor([upsampled, audio.to(upsampled.device)])
+        else:
+            out["samples"] = upsampled
+
+        return (out,)
+
+
+class LTXVAVLatentUpsamplerTiled:
+    """
+    Temporally tiled version of the LTX AV latent upsampler.
+
+    Splits the video latent into overlapping temporal tiles, upsamples each
+    on GPU, and blends them back with a linear crossfade. Viable when the
+    upsampled latent feeds a low-sigma refinement pass, which smooths over
+    any residual tiling statistics differences.
+
+    Use the non-tiled LTX AV Latent Upsampler instead when you need to
+    process the full tensor in one shot (with CPU fallback).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples":       ("LATENT",),
+                "upscale_model": ("LATENT_UPSCALE_MODEL",),
+                "vae":           ("VAE",),
+                "tile_frames": ("INT", {
+                    "default": 16, "min": 2, "max": 256, "step": 1,
+                    "tooltip": "Latent frames per temporal tile.",
+                }),
+                "tile_overlap": ("INT", {
+                    "default": 4, "min": 1, "max": 64, "step": 1,
+                    "tooltip": "Latent frames of overlap between tiles used for blending.",
+                }),
+            }
+        }
+
+    RETURN_TYPES  = ("LATENT",)
+    FUNCTION      = "upsample_latent"
+    CATEGORY      = "LTXAVTools/utils"
+
+    def upsample_latent(self, samples, upscale_model, vae, tile_frames, tile_overlap):
+        raw   = samples["samples"]
+        is_av = _HAS_NESTED and isinstance(raw, NestedTensor)
+
+        if is_av:
+            video = raw.tensors[0]   # [B, C, T, H, W]
+            audio = raw.tensors[1]
+        else:
+            video = raw
+            audio = None
+
+        stats       = vae.first_stage_model.per_channel_statistics
+        model_dtype = next(upscale_model.parameters()).dtype
+        input_dtype = video.dtype
+        inter_dev   = model_management.intermediate_device()
+        gpu_dev     = model_management.get_torch_device()
+
+        T    = video.shape[2]
+        step = max(1, tile_frames - tile_overlap)
+
+        result         = None
+        result_weights = None
+
+        upscale_model.to(gpu_dev)
+        try:
+            t_start = 0
+            while t_start < T:
+                t_end  = min(t_start + tile_frames, T)
+                tile_v = video[:, :, t_start:t_end]
+
+                tile_un  = stats.un_normalize(tile_v).to(dtype=model_dtype, device=gpu_dev)
+                up_tile  = upscale_model(tile_un)
+                up_tile  = stats.normalize(up_tile).to(dtype=input_dtype, device=inter_dev)
+
+                if result is None:
+                    B, C, _, H_up, W_up = up_tile.shape
+                    result         = torch.zeros(B, C, T, H_up, W_up,
+                                                 device=inter_dev, dtype=input_dtype)
+                    result_weights = torch.zeros(B, 1, T, 1, 1,
+                                                 device=inter_dev, dtype=input_dtype)
+
+                tile_T  = t_end - t_start
+                w       = torch.ones(tile_T, device=inter_dev, dtype=input_dtype)
+                if t_start > 0:
+                    w[:tile_overlap] = torch.linspace(0, 1, tile_overlap,
+                                                      device=inter_dev, dtype=input_dtype)
+                if t_end < T:
+                    w[-tile_overlap:] = torch.minimum(
+                        w[-tile_overlap:],
+                        torch.linspace(1, 0, tile_overlap, device=inter_dev, dtype=input_dtype),
+                    )
+
+                w = w.view(1, 1, tile_T, 1, 1)
+                result[:, :, t_start:t_end]         += up_tile * w
+                result_weights[:, :, t_start:t_end] += w
+
+                print(f"[LTXVAVLatentUpsamplerTiled] tile [{t_start},{t_end}) "
+                      f"of {T} latent frames")
+
+                if t_end >= T:
+                    break
+                t_start += step
+        finally:
+            upscale_model.cpu()
+
+        result = result / (result_weights + 1e-8)
+
+        out = samples.copy()
+        out.pop("noise_mask", None)
+
+        if is_av:
+            out["samples"] = NestedTensor([result, audio.to(result.device)])
+        else:
+            out["samples"] = result
+
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "PreviewImagePassthrough": PreviewImagePassthrough,
-    "LTXAVLatentCheck":        LTXAVLatentCheck,
-    "LTXAVSeparateCheck":      LTXAVSeparateCheck,
-    "LTXAudioLatentPad":       LTXAudioLatentPad,
+    "PreviewImagePassthrough":          PreviewImagePassthrough,
+    "LTXAVLatentCheck":                 LTXAVLatentCheck,
+    "LTXAVSeparateCheck":               LTXAVSeparateCheck,
+    "LTXAudioLatentPad":                LTXAudioLatentPad,
+    "LTXVAVLatentUpsampler":            LTXVAVLatentUpsampler,
+    "LTXVAVLatentUpsamplerTiled":       LTXVAVLatentUpsamplerTiled,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "PreviewImagePassthrough": "Preview Image Passthrough",
-    "LTXAVLatentCheck":        "LTX AV Latent Check",
-    "LTXAVSeparateCheck":      "LTX AV Separate Check",
-    "LTXAudioLatentPad":       "LTX Audio Latent Pad",
+    "PreviewImagePassthrough":          "Preview Image Passthrough",
+    "LTXAVLatentCheck":                 "LTX AV Latent Check",
+    "LTXAVSeparateCheck":               "LTX AV Separate Check",
+    "LTXAudioLatentPad":                "LTX Audio Latent Pad",
+    "LTXVAVLatentUpsampler":            "LTX AV Latent Upsampler",
+    "LTXVAVLatentUpsamplerTiled":       "LTX AV Latent Upsampler (Tiled)",
 }

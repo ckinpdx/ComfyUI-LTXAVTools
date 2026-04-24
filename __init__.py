@@ -6,7 +6,7 @@ from .nodes.sigma_character import NODE_CLASS_MAPPINGS as _SCCM, NODE_DISPLAY_NA
 from .nodes.utils import NODE_CLASS_MAPPINGS as _UCM, NODE_DISPLAY_NAME_MAPPINGS as _UDM
 from .nodes.av_looping_sampler import NODE_CLASS_MAPPINGS as _ALSCM, NODE_DISPLAY_NAME_MAPPINGS as _ALSDM
 
-NODE_CLASS_MAPPINGS = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM}
+NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM}
 NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM}
 
 WEB_DIRECTORY = "./web/js"

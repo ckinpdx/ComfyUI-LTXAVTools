@@ -389,17 +389,11 @@ class LTXVAVLoopingSampler:
         positive, negative = _get_raw_conds(guider)
 
         T_v = min(temporal_tile_size, video_tile_latent["samples"].shape[2])
-        num_px = (T_v - 1) * time_scale + 1
 
-        # video init — use initialization latent if non-empty, else empty
+        # Always seed from the input latent. For first-stage it is zeros (no-op);
+        # for second-stage it carries the first-stage prior into the sampler.
         v_samples = video_tile_latent["samples"]
-        if v_samples.shape[2] >= T_v and v_samples.abs().sum() > 0:
-            video_init = {"samples": v_samples[:, :, :T_v].clone()}
-        else:
-            video_init = EmptyLTXVLatentVideo.execute(
-                width=tile_w * width_scale, height=tile_h * height_scale,
-                length=num_px, batch_size=1,
-            )[0]
+        video_init = {"samples": v_samples[:, :, :T_v].clone()}
 
         # I2V: encode image at frame 0
         if cond_images is not None and kf_idx_str:
@@ -510,10 +504,36 @@ class LTXVAVLoopingSampler:
         overlap_video = _select_video_frames(video_acc, -temporal_overlap, -1)
         num_px_total  = (T_v_chunk - 1) * time_scale + 1
 
-        video_init = EmptyLTXVLatentVideo.execute(
-            width=tile_w * width_scale, height=tile_h * height_scale,
-            length=num_px_total, batch_size=1,
-        )[0]
+        # Initialize the full chunk (overlap + new frames) from the input latent.
+        # This matches LTXVExtendSampler's approach: optional_initialization_latents
+        # covers the entire chunk window — both the overlap AND the new-frame region.
+        # For first-stage generation the input is zeros, so this is equivalent to
+        # EmptyLTXVLatentVideo. For second-stage / v2v the overlap region now carries
+        # the first-stage prior, preventing the model from starting the overlap
+        # region from scratch and causing a rewind/skipping artifact.
+        v_full = video_tile_latent["samples"]
+        T_v_full  = v_full.shape[2]
+        v_chunk_start = v_start - temporal_overlap
+        dev, dty  = v_full.device, v_full.dtype
+        B, C      = v_full.shape[0], v_full.shape[1]
+        lH, lW    = v_full.shape[3], v_full.shape[4]
+
+        if v_chunk_start >= 0:
+            avail_end = min(v_end, T_v_full)
+            avail_len = max(0, avail_end - v_chunk_start)
+            if avail_len >= T_v_chunk:
+                chunk_v = v_full[:, :, v_chunk_start:v_chunk_start + T_v_chunk].clone()
+            else:
+                chunk_v = torch.zeros(B, C, T_v_chunk, lH, lW, device=dev, dtype=dty)
+                if avail_len > 0:
+                    chunk_v[:, :, :avail_len] = v_full[:, :, v_chunk_start:avail_end]
+            video_init = {"samples": chunk_v}
+        else:
+            # Fallback for unusual configurations (temporal_overlap > v_start)
+            video_init = EmptyLTXVLatentVideo.execute(
+                width=tile_w * width_scale, height=tile_h * height_scale,
+                length=num_px_total, batch_size=1,
+            )[0]
 
         positive, negative, video_init = self._add_latent_guide(
             vae, positive, negative, video_init,
