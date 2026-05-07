@@ -1,6 +1,6 @@
 # ComfyUI-LTXAVTools
 
-Utility nodes for LTX2 audio-video generation workflows in ComfyUI.
+Utility nodes for LTX-2.3 audio-video generation and LoRA training workflows in ComfyUI.
 
 ---
 
@@ -150,3 +150,86 @@ Audio continuity across chunk boundaries is maintained through three complementa
 - `AUDIO_LATENTS_PER_SECOND = 25.0` (fixed for LTX2 AV)
 - LTX first-frame asymmetry: first video latent = 1 pixel frame, all subsequent = 8 pixel frames. Pixel frame count: `px = (T_v - 1) * 8 + 1`.
 - Output is trimmed to exactly match the requested frame count after sampling. Any overshoot from the last chunk's tile window is discarded.
+
+---
+
+## LoRA Training
+
+Two-phase LoRA training pipeline for LTX-2.3 (22B AV model) via [musubi-tuner](https://github.com/AkaneTendo25/musubi-tuner). Phase 1 trains visual character identity on images; Phase 2 warm-starts from that LoRA and trains audio layers on voice/sound clips. The two phases produce a single merged LoRA covering both visual and audio identity.
+
+Requires musubi-tuner installed and configured with an LTX-2.3 checkpoint and Gemma text encoder.
+
+---
+
+### LTXAV Character LoRA Training
+
+**Phase 1.** Trains a LoRA on a character's visual identity using static images. Outputs the trained LoRA path for use as the warm-start input to Phase 2.
+
+Dynamic image slots — connect 1–20 `IMAGE` inputs and set `image_count` to match. Each slot has a `caption_N` text field for the image description.
+
+| Input | Default | Description |
+|---|---|---|
+| `model` | — | Loaded LTX model |
+| `workspace_dir` | — | Root folder for all training artifacts |
+| `run_name` | `CharacterLoraTrainingRun` | Label for logs |
+| `output_name` | `CharacterLoraTraining` | Prefix for output LoRA files |
+| `image_count` | 4 | Number of active image slots (1–20) |
+| `training_steps` | 1000 | Total training steps |
+| `num_repeats` | 4 | Dataset repeats per epoch |
+| `lora_target_preset` | `full` | Layer target (`full`, `attn`, etc.) |
+| `network_dim` | 32 | LoRA rank |
+| `network_alpha` | 16 | LoRA alpha |
+| `learning_rate` | 1e-4 | Training learning rate |
+| `blocks_to_swap` | 20 | CPU-offload blocks to reduce VRAM usage |
+| `cache_strategy` | `auto` | `auto` / `force` / `skip` latent cache |
+| `musubi_root` | — | Path to musubi-tuner installation |
+| `ltx2_checkpoint` | — | Path to LTX-2.3 `.safetensors` checkpoint |
+| `gemma_root` | — | Path to Gemma text encoder root |
+
+**Outputs:** `model`, `latest_state_path`, `lora_path`, `log_path`, `video_filename_prefix`, `output_name`, `completed_steps`, `total_target_steps`
+
+Connect `lora_path` → `base_lora_path` on the audio training node.
+
+---
+
+### LTXAV Audio LoRA Training
+
+**Phase 2.** Continues training from the Phase 1 LoRA, targeting only the LTX-2.3 audio attention layers (`audio_attn`, `video_to_audio_attn`, `audio_ff`). Trains on short audio clips with captions. On completion, merges the audio-layer weights back into the character LoRA to produce a single unified file.
+
+Dynamic audio slots — connect 1–20 `AUDIO` inputs (e.g. from VHS Load Audio) and set `audio_count` to match. Each slot has a `caption_N` text field.
+
+| Input | Default | Description |
+|---|---|---|
+| `model` | — | Loaded LTX model |
+| `base_lora_path` | — | `lora_path` output from Phase 1 |
+| `workspace_dir` | — | Same root folder as Phase 1 (audio artifacts go in `audio_*` subdirs) |
+| `run_name` | `AudioLoraTrainingRun` | Label for logs |
+| `output_name` | `AudioLoraTraining` | Prefix for audio LoRA output files |
+| `audio_count` | 8 | Number of active audio slots (1–20) |
+| `training_steps` | 400 | Total training steps |
+| `num_repeats` | 2 | Dataset repeats per epoch |
+| `network_dim` | 32 | LoRA rank — must match Phase 1 |
+| `network_alpha` | 16 | LoRA alpha — must match Phase 1 |
+| `learning_rate` | 1e-4 | Training learning rate |
+| `blocks_to_swap` | 0 | CPU-offload blocks |
+| `audio_bucket_interval` | 2.0 | Audio bucket step size in seconds |
+| `audio_bucket_strategy` | `pad` | `pad` (loss-masks padding) or `truncate` |
+| `audio_only_target_resolution` | 64 | Latent geometry resolution for audio-only mode |
+| `audio_only_sequence_resolution` | 64 | Virtual sequence resolution for noise schedule |
+| `ltx2_audio_only_model` | `true` | Use the physically audio-only transformer variant |
+| `cache_strategy` | `auto` | `auto` / `force` / `skip` latent cache |
+| `musubi_root` | — | Path to musubi-tuner installation |
+| `ltx2_checkpoint` | — | Path to LTX-2.3 checkpoint |
+| `gemma_root` | — | Path to Gemma text encoder root |
+
+**Outputs:** `model`, `latest_state_path`, `merged_lora_path`, `log_path`, `output_name`, `completed_steps`, `total_target_steps`
+
+`merged_lora_path` is the single unified `.comfy.safetensors` combining Phase 1 visual weights and Phase 2 audio weights. Use this file for inference — no need to stack two LoRAs.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Portions derived from or inspired by [comfyui-vrgamedevgirl](https://github.com/vrgamegirl19/comfyui-vrgamedevgirl) by vrgamegirl19 (MIT).
