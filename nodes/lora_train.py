@@ -1246,14 +1246,28 @@ class LTXAV_AudioLoraTraining(_LTXLoraTrainBase):
         print(f"[LTXAVTools] Filtered base LoRA to {len(filtered)} audio keys → {out_path}")
         return out_path
 
+    # video_to_audio_attn is the lip sync cross-attention mechanism — training it on
+    # audio-only clips (no video) destroys video-audio alignment. Keep the character
+    # LoRA's version of these layers; only take pure audio identity layers from Phase 2.
+    _AUDIO_IDENTITY_ONLY_FRAGMENTS = ("audio_attn", "audio_ff")
+
     def _merge_character_and_audio_loras(self, character_lora_path, audio_lora_path, output_dir, output_name):
         from safetensors.torch import load_file, save_file
         base_sd = load_file(character_lora_path)
         audio_sd = load_file(audio_lora_path)
-        merged = {**base_sd, **audio_sd}  # audio keys overwrite character keys where they overlap
+        merged = dict(base_sd)
+        audio_identity_keys = 0
+        skipped_keys = 0
+        for k, v in audio_sd.items():
+            if any(frag in k for frag in self._AUDIO_IDENTITY_ONLY_FRAGMENTS):
+                merged[k] = v
+                audio_identity_keys += 1
+            else:
+                skipped_keys += 1
         out_path = os.path.join(output_dir, f"{output_name}-merged.comfy.safetensors")
         save_file(merged, out_path)
-        print(f"[LTXAVTools] Merged LoRA: {len(base_sd)} base + {len(audio_sd)} audio = {len(merged)} keys → {out_path}")
+        print(f"[LTXAVTools] Merged LoRA: {len(base_sd)} base + {audio_identity_keys} audio identity keys "
+              f"({skipped_keys} video_to_audio_attn keys kept from base) = {len(merged)} total → {out_path}")
         return os.path.normpath(out_path)
 
     def _extract_audio_waveform(self, value):
