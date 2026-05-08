@@ -1221,7 +1221,10 @@ class LTXAV_AudioLoraTraining(_LTXLoraTrainBase):
                 "ltx2_checkpoint": ("STRING", {"default": "", "multiline": False}),
                 "gemma_root": ("STRING", {"default": "", "multiline": False}),
             },
-            "optional": optional_inputs,
+            "optional": {
+                **optional_inputs,
+                "execution_signal": ("STRING", {"forceInput": True, "tooltip": "Connect any string output here to force this node to wait until that upstream node completes."}),
+            },
         }
 
     # --- dataset helpers ---
@@ -1687,7 +1690,8 @@ class LTXAV_AudioLoraTraining(_LTXLoraTrainBase):
             except Exception as exc:
                 print(f"[LTXAVTools] WARNING: LoRA merge failed ({exc}); merged_lora_path will be empty")
 
-        output_model = self._apply_lora_to_model(model, applied_lora_path, strength_model)
+        lora_to_apply = merged_lora_path if merged_lora_path else applied_lora_path
+        output_model = self._apply_lora_to_model(model, lora_to_apply, strength_model)
 
         return (
             output_model,
