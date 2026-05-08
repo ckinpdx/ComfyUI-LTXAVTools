@@ -8,14 +8,12 @@ Audio alignment notes:
   - AUDIO_LATENTS_PER_SECOND = 25.0 (fixed for LTX AV)
   - First video latent = 1 pixel frame; subsequent = 8 pixel frames (LTX asymmetry)
   - Each extend chunk generates 7 fewer audio frames than the global timeline expects
-    due to the first-frame treatment. Fixed by: drop 1 audio frame (frame 0) + pad 7.
-  - Audio blend overlap = a_overlap + 6, giving exact num_new_v * 8 frame growth per chunk.
+    due to the first-frame treatment. Fixed by: drop 1 audio frame (frame 0) + pad 1.
 
 Spatial tiling with AV: audio accumulated from tile (0,0) only.
 """
 
 import copy
-import math
 
 import comfy
 import comfy.utils
@@ -24,7 +22,6 @@ import torch
 from comfy.nested_tensor import NestedTensor
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced, SplitSigmas
 from comfy_extras.nodes_lt import (
-    EmptyLTXVLatentVideo,
     LTXVAddGuide,
     LTXVCropGuides,
     _append_guide_attention_entry,
@@ -502,38 +499,40 @@ class LTXVAVLoopingSampler:
 
         # video: last overlap frames from accumulated output as guide
         overlap_video = _select_video_frames(video_acc, -temporal_overlap, -1)
-        num_px_total  = (T_v_chunk - 1) * time_scale + 1
 
-        # Initialize the full chunk (overlap + new frames) from the input latent.
-        # This matches LTXVExtendSampler's approach: optional_initialization_latents
-        # covers the entire chunk window — both the overlap AND the new-frame region.
-        # For first-stage generation the input is zeros, so this is equivalent to
-        # EmptyLTXVLatentVideo. For second-stage / v2v the overlap region now carries
-        # the first-stage prior, preventing the model from starting the overlap
-        # region from scratch and causing a rewind/skipping artifact.
-        v_full = video_tile_latent["samples"]
-        T_v_full  = v_full.shape[2]
-        v_chunk_start = v_start - temporal_overlap
-        dev, dty  = v_full.device, v_full.dtype
-        B, C      = v_full.shape[0], v_full.shape[1]
-        lH, lW    = v_full.shape[3], v_full.shape[4]
+        # Build chunk initialization.
+        #
+        # Overlap region [0..temporal_overlap-1]: always from the accumulated output.
+        #
+        # New-frame region [temporal_overlap..T_v_chunk-1]: from the input latent
+        # starting at n_acc = video_acc.shape[2], i.e. the frame IMMEDIATELY after
+        # the last accumulated position.
+        #
+        # The old approach used v_chunk_start = v_start - temporal_overlap, which
+        # indexed the input latent temporal_overlap frames too early. After every
+        # extend chunk the accumulator grows by num_new_v but v_start only advances
+        # by step = num_new_v - temporal_overlap, so the offset grew by temporal_overlap
+        # per chunk. In a v2v / 2-pass workflow this caused a progressively worsening
+        # rewind artifact: local frame 2 was initialized from pass-1 content at
+        # position n_acc - temporal_overlap instead of n_acc, so the model produced
+        # output that looked like it was rewinding back by ~temporal_overlap frames.
+        #
+        # In 1-pass (input is zeros) n_acc still gives zeros — no behaviour change.
+        v_full   = video_tile_latent["samples"]
+        T_v_full = v_full.shape[2]
+        dev, dty = v_full.device, v_full.dtype
+        B, C     = v_full.shape[0], v_full.shape[1]
+        lH, lW   = v_full.shape[3], v_full.shape[4]
 
-        if v_chunk_start >= 0:
-            avail_end = min(v_end, T_v_full)
-            avail_len = max(0, avail_end - v_chunk_start)
-            if avail_len >= T_v_chunk:
-                chunk_v = v_full[:, :, v_chunk_start:v_chunk_start + T_v_chunk].clone()
-            else:
-                chunk_v = torch.zeros(B, C, T_v_chunk, lH, lW, device=dev, dtype=dty)
-                if avail_len > 0:
-                    chunk_v[:, :, :avail_len] = v_full[:, :, v_chunk_start:avail_end]
-            video_init = {"samples": chunk_v}
-        else:
-            # Fallback for unusual configurations (temporal_overlap > v_start)
-            video_init = EmptyLTXVLatentVideo.execute(
-                width=tile_w * width_scale, height=tile_h * height_scale,
-                length=num_px_total, batch_size=1,
-            )[0]
+        n_acc   = video_acc["samples"].shape[2]
+        ov      = overlap_video["samples"]
+        chunk_v = torch.zeros(B, C, T_v_chunk, lH, lW, device=dev, dtype=dty)
+        chunk_v[:, :, :ov.shape[2]] = ov
+        if n_acc < T_v_full:
+            avail_new = min(num_new_v, T_v_full - n_acc)
+            chunk_v[:, :, temporal_overlap : temporal_overlap + avail_new] = \
+                v_full[:, :, n_acc : n_acc + avail_new]
+        video_init = {"samples": chunk_v}
 
         positive, negative, video_init = self._add_latent_guide(
             vae, positive, negative, video_init,
@@ -595,14 +594,6 @@ class LTXVAVLoopingSampler:
         audio_mask = torch.ones(B, 1, T_a_chunk, F_s, device=dev, dtype=dty)
         audio_mask[:, :, :a_overlap, :] = 1.0 - audio_overlap_cond_strength
         audio_mask[:, :, a_overlap:,  :] = 1.0 - audio_cond_strength
-
-        # ref_audio: inject carry-over as guide tokens so the model attends to
-        # the spectral character of the previous chunk (audio equivalent of video
-        # guide tokens). Complements the noise mask with identity-level continuity.
-        ref_tokens = audio_carry.permute(0, 2, 1, 3).reshape(B, a_overlap, C_a * F_s)
-        ref_audio  = {"tokens": ref_tokens}
-        positive   = node_helpers.conditioning_set_values(positive, {"ref_audio": ref_audio})
-        negative   = node_helpers.conditioning_set_values(negative, {"ref_audio": ref_audio})
 
         a_start_global = audio_acc.shape[2] - a_overlap
         self._debug_chunk(
@@ -789,7 +780,6 @@ class LTXVAVLoopingSampler:
         guiding_start_step=0, guiding_end_step=1000,
         optional_cond_image_indices="0",
         per_tile_seed_offsets="0",          # hidden
-        optional_negative_index_strength_v=1.0,  # alias
     ):
         samples = latents["samples"]
         if not isinstance(samples, NestedTensor):
