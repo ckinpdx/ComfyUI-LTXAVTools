@@ -80,7 +80,7 @@ Pads a 4D audio latent `[B, C, T, F]` by repeating its last frame N times (defau
 ---
 
 ### LTX Add Audio Latent Guide
-Injects a raw audio latent as reference conditioning for LTX2 AV generation. The audio is placed at negative temporal RoPE positions (before t=0) so it influences audio character without contaminating the generated latent sequence.
+Injects a raw audio latent as reference conditioning for LTX2.3 AV generation. The audio is placed at negative temporal RoPE positions (before t=0) so it influences audio character without contaminating the generated latent sequence.
 
 Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` first if you have a combined AV latent.
 
@@ -154,7 +154,7 @@ Displays an image preview and passes the image through unchanged. Useful inside 
 
 ## LTX AV Looping Sampler
 
-Temporal (and optionally spatial) tiling sampler for long-form video+audio generation with the LTX2 AV model. Generates video and audio jointly as a NestedTensor latent across multiple overlapping chunks, accumulating a coherent sequence longer than any single context window.
+Temporal (and optionally spatial) tiling sampler for long-form video+audio generation with the LTX2.3 AV model. Generates video and audio jointly as a NestedTensor latent across multiple overlapping chunks, accumulating a coherent sequence longer than any single context window.
 
 Input latent must be an AV NestedTensor sized to the full output — the video component defines resolution and frame count, the audio component the matching audio length. Build it with the core `LTXVConcatAVLatent` node (video latent + audio latent), an AV VAE encode, or `LTX AV Extend Latent`. Do **not** use `LTX Audio Only Latent` here — its video component is a 1-frame dummy intended for audio-only generation. Use `LTXVLoopingSampler` (ComfyUI-LTXVideo) for video-only generation.
 
@@ -180,7 +180,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `horizontal_tiles` | 1 | Number of spatial tiles horizontally. |
 | `vertical_tiles` | 1 | Number of spatial tiles vertically. Audio is accumulated from tile (0,0) only. |
 | `spatial_overlap` | 1 | Latent-space pixels of spatial overlap between tiles. |
-| `video_fps` | 25.0 | Must match the fps of the AV latent. Used for audio frame alignment. LTX2 AV is trained at 25 fps. |
+| `video_fps` | 25.0 | Must match the fps of the AV latent. Used for audio frame alignment. LTX2.3 AV is trained at 25 fps. |
 
 ### Optional inputs
 
@@ -208,7 +208,7 @@ For voice identity continuity across separate generations, use `LTX Add Audio La
 
 ### Audio alignment notes
 
-- `AUDIO_LATENTS_PER_SECOND = 25.0` (fixed for LTX2 AV)
+- `AUDIO_LATENTS_PER_SECOND = 25.0` (fixed for LTX2.3 AV)
 - LTX first-frame asymmetry: first video latent = 1 pixel frame, all subsequent = 8 pixel frames. Pixel frame count: `px = (T_v - 1) * 8 + 1`.
 - Output is trimmed to exactly match the requested frame count after sampling. Any overshoot from the last chunk's tile window is discarded.
 
