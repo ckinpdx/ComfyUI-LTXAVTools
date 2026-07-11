@@ -43,8 +43,8 @@ class LTXAudioOnlyLatent:
         device = comfy.model_management.intermediate_device()
 
         z_channels = audio_vae.latent_channels
-        freq_bins = audio_vae.latent_frequency_bins
-        latents_per_second = audio_vae.latents_per_second
+        freq_bins = audio_vae.first_stage_model.latent_frequency_bins
+        latents_per_second = audio_vae.first_stage_model.latents_per_second
 
         num_audio_latents = math.ceil(seconds * latents_per_second)
 

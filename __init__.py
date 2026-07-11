@@ -6,9 +6,10 @@ from .nodes.sigma_character import NODE_CLASS_MAPPINGS as _SCCM, NODE_DISPLAY_NA
 from .nodes.utils import NODE_CLASS_MAPPINGS as _UCM, NODE_DISPLAY_NAME_MAPPINGS as _UDM
 from .nodes.av_looping_sampler import NODE_CLASS_MAPPINGS as _ALSCM, NODE_DISPLAY_NAME_MAPPINGS as _ALSDM
 from .nodes.lora_train import NODE_CLASS_MAPPINGS as _LTCM, NODE_DISPLAY_NAME_MAPPINGS as _LTDM
+from .nodes.character_dataset_prompt import NODE_CLASS_MAPPINGS as _CDPCM, NODE_DISPLAY_NAME_MAPPINGS as _CDPDM
 
-NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM}
-NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM}
+NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM, **_CDPCM}
+NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM, **_CDPDM}
 
 WEB_DIRECTORY = "./web/js"
 
