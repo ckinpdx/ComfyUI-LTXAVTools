@@ -344,8 +344,16 @@ class LTXVAVLoopingSampler:
         new_g = copy.copy(guider)
         positive, negative = _get_raw_conds(guider)
         idx = min(chunk_index, len(optional_positive_conditionings) - 1)
-        new_g.set_conds(optional_positive_conditionings[idx], negative)
-        new_g.raw_conds = (optional_positive_conditionings[idx], negative)
+        chunk_pos = optional_positive_conditionings[idx]
+        # Per-chunk prompts are encoded from bare text and lack conditioning-level
+        # values set upstream (e.g. ref_audio from LTXVReferenceAudio / ID-LoRA).
+        # Carry them over from the base positive, otherwise identity guidance
+        # nulls out (cond == no-ref cond) while still paying its extra pass.
+        ref_audio = positive[0][1].get("ref_audio")
+        if ref_audio is not None:
+            chunk_pos = node_helpers.conditioning_set_values(chunk_pos, {"ref_audio": ref_audio})
+        new_g.set_conds(chunk_pos, negative)
+        new_g.raw_conds = (chunk_pos, negative)
         return new_g
 
     def _calculate_keyframe_per_tile_indices(self, keyframe_indices,

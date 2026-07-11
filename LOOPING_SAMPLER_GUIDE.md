@@ -198,6 +198,14 @@ pre-t = 0) at the conditioning level — the audio analog of image reference con
 Use when separate videos of the same character should share a voice without conditioning
 on a full track.
 
+For ID-LoRA voice locking, use the core `LTXVReferenceAudio` node instead (~5s clean
+reference clip): it sets `ref_audio` and patches the model with an identity-guidance
+pass (extra forward pass per step — wire into stage 1 only; restrict via
+`start/end_percent` if compute matters). ID-LoRA checkpoints expect the structured
+prompt format `[VISUAL]: … [SPEECH]: exact words [SOUNDS]: voice style + ambient`;
+keep the `[SOUNDS]` voice descriptor identical across segments. The sampler carries
+`ref_audio` onto per-chunk prompts automatically.
+
 ---
 
 ## 7. Motion guidance (IC-LoRA)
