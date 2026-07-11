@@ -46,6 +46,37 @@ Trims a 4D audio latent `[B, C, T, F]` along the temporal axis. Supports negativ
 ### Latent Strip Mask
 Removes `noise_mask` from any latent dict. Useful before feeding latents into `LTXVAddLatents` to prevent mask merge errors.
 
+### LTX Audio Only Latent
+Creates an AV NestedTensor for **audio-only generation**: a zero audio latent of the requested duration paired with a minimal 1-frame dummy video latent. Wire the output into `LTXVAudioVideoMask` (KJNodes) using `audio_latent_frames` to set up the denoise mask before sampling.
+
+Not a valid input for the AV Looping Sampler — the dummy video component would define a 1-frame output.
+
+| Input | Description |
+|---|---|
+| `audio_vae` | Audio VAE (provides channels, frequency bins, latents/second) |
+| `seconds` | Audio duration |
+| `batch_size` | Batch size |
+
+**Outputs:** `latent` (AV NestedTensor), `audio_latent_frames`
+
+### LTX AV Extend Latent
+Prepares an AV NestedTensor for extending existing content. Appends zero latents (video plus time-matched audio) for the extension region and pre-builds the noise mask: `existing_denoise` over the existing frames (0.0 = fully preserve), 1.0 over the new region.
+
+Wire `extension_start_frame` into `optional_cond_image_indices` on the looping sampler and supply the last frame of the existing video as the keyframe image, giving the model a hard visual anchor at the transition.
+
+| Input | Default | Description |
+|---|---|---|
+| `av_latent` | — | Existing AV NestedTensor (encoded content) |
+| `vae` | — | Video VAE (supplies the time scale factor) |
+| `extension_seconds` | 3.0 | Duration to add beyond the existing content |
+| `fps` | 25.0 | Must match the AV latent |
+| `existing_denoise` | 0.0 | Mask value over existing frames; 0.1–0.3 allows light refinement near the transition |
+
+**Outputs:** `av_latent`, `extension_start_frame`, `last_existing_frame` (pixel-frame indices)
+
+### LTX Audio Latent Pad
+Pads a 4D audio latent `[B, C, T, F]` by repeating its last frame N times (default 7). Closes the 7-frame audio gap that appears at concatenation boundaries in manual sliding-window loops due to LTX's first-frame asymmetry. Strips any noise mask.
+
 ---
 
 ### LTX Add Audio Latent Guide
@@ -60,6 +91,11 @@ Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` f
 | `audio_guide_latent` | 4D audio latent to inject as reference |
 
 **Outputs:** `positive`, `negative`
+
+### LTX Crop Audio Guide
+Removes `ref_audio` from conditioning after sampling. Pair with LTX Add Audio Latent Guide — call after the sampler so a stale audio reference doesn't leak into subsequent passes. No latent trimming is needed (audio guides don't append tokens to the latent).
+
+**Inputs:** `positive`, `negative` — **Outputs:** `positive`, `negative`
 
 ---
 
@@ -92,11 +128,35 @@ Resamples a sigma schedule to a different step count while preserving its essent
 
 ---
 
+## Utility Nodes
+
+### LTX AV Latent Upsampler
+AV-aware wrapper around the LTX latent upscale model. Upsamples the video component of an AV NestedTensor (or a plain video latent); audio passes through unchanged. Processes the full tensor in one shot — the upscaler's GroupNorm normalizes across T×H×W jointly, so temporal chunking shifts the statistics and causes seams regardless of overlap. Tries GPU first and falls back to CPU on OOM.
+
+### LTX AV Latent Upsampler (Tiled)
+Temporally tiled variant: overlapping temporal tiles are upsampled on GPU and blended back with a linear crossfade. Viable when the result feeds a low-sigma refinement pass, which smooths residual tile-statistics differences. Use the non-tiled version when exact full-tensor statistics matter.
+
+| Input | Default | Description |
+|---|---|---|
+| `tile_frames` | 16 | Latent frames per temporal tile |
+| `tile_overlap` | 4 | Latent frames of blend overlap |
+
+### LTX AV Latent Check
+Verifies that the video and audio components of a combined AV NestedTensor are time-matched. Reports video latent frames, audio latent frames, expected audio frames (`(T_v − 1) × 8 + 1` pixel frames at 25 audio latents/second), the delta, and an `is_matched` boolean. Passes the latent through unchanged.
+
+### LTX AV Separate Check
+Same alignment math for split video + audio latents. Place after trim operations to verify the pair is still in sync.
+
+### Preview Image Passthrough
+Displays an image preview and passes the image through unchanged. Useful inside loops where terminal PreviewImage nodes don't refresh per iteration.
+
+---
+
 ## LTX AV Looping Sampler
 
 Temporal (and optionally spatial) tiling sampler for long-form video+audio generation with the LTX2 AV model. Generates video and audio jointly as a NestedTensor latent across multiple overlapping chunks, accumulating a coherent sequence longer than any single context window.
 
-Input latent must be an AV NestedTensor (e.g. from `LTXAudioOnlyLatent` or an AV encode). Use `LTXVLoopingSampler` for video-only generation.
+Input latent must be an AV NestedTensor sized to the full output — the video component defines resolution and frame count, the audio component the matching audio length. Build it with the core `LTXVConcatAVLatent` node (video latent + audio latent), an AV VAE encode, or `LTX AV Extend Latent`. Do **not** use `LTX Audio Only Latent` here — its video component is a 1-frame dummy intended for audio-only generation. Use `LTXVLoopingSampler` (ComfyUI-LTXVideo) for video-only generation.
 
 **Output:** `denoised_output` — AV NestedTensor LATENT
 
@@ -111,7 +171,7 @@ Input latent must be an AV NestedTensor (e.g. from `LTXAudioOnlyLatent` or an AV
 | `sigmas` | — | Sigma schedule |
 | `guider` | — | Guider (e.g. CFGGuider) |
 | `latents` | — | AV NestedTensor latent defining the generation shape |
-| `temporal_tile_size` | 80 | Pixel frames per temporal chunk. Must satisfy `(size - 1) % 8 == 0`. |
+| `temporal_tile_size` | 80 | Pixel frames per temporal chunk. Multiple of 8, minimum 24. |
 | `temporal_overlap` | 24 | Pixel frames of overlap between chunks. The overlapping region from the previous chunk is injected as a guide so the model maintains visual continuity. |
 | `guiding_strength` | 1.0 | Conditioning strength for guiding latents (IC-LoRA / latent guides). |
 | `temporal_overlap_cond_strength` | 0.5 | Noise mask strength for the video carry-over (overlap) region. Higher values hold the overlap more rigidly; lower values let the model blend more freely. |
@@ -139,11 +199,12 @@ Input latent must be an AV NestedTensor (e.g. from `LTXAudioOnlyLatent` or an AV
 
 ### Audio continuity
 
-Audio continuity across chunk boundaries is maintained through three complementary mechanisms:
+Audio continuity across chunk boundaries is maintained through two complementary mechanisms:
 
 1. **Noise mask carry-over** — the last N audio frames from the accumulated output are carried into each chunk's init latent with a strong conditioning mask (`audio_overlap_cond_strength`).
-2. **ref_audio guide tokens** — the carry-over frames are reshaped into token format and injected as `ref_audio` conditioning, so the model attends to the spectral identity of the previous chunk.
-3. **Bridge stitching** — the stitched audio uses the model's own regenerated carry-over as the join point rather than a hard latent-space concatenation, avoiding spectral discontinuities at boundaries.
+2. **Bridge stitching** — when stitching, the accumulated audio tail is replaced by the model's own regenerated carry-over rather than hard-concatenated, avoiding spectral discontinuities at boundaries. The chunk's first audio frame (the first-frame-asymmetry stub) is dropped and one tail frame padded to preserve exact length.
+
+For voice identity continuity across separate generations, use `LTX Add Audio Latent Guide` to inject reference audio at the conditioning level.
 
 ### Audio alignment notes
 
@@ -225,6 +286,22 @@ Dynamic audio slots — connect 1–20 `AUDIO` inputs (e.g. from VHS Load Audio)
 **Outputs:** `model`, `latest_state_path`, `merged_lora_path`, `log_path`, `output_name`, `completed_steps`, `total_target_steps`
 
 `merged_lora_path` is the single unified `.comfy.safetensors` combining Phase 1 visual weights and Phase 2 audio weights. Use this file for inference — no need to stack two LoRAs.
+
+---
+
+### Character Dataset Prompt Generator
+
+Companion node for building Phase 1 image datasets. Generates non-repeating camera-angle prompts: 8 horizontal angles × 3 vertical angles × 6 framings (135 valid views — rear angles exclude face close-ups), each combined with a neutral pose, white studio backdrop, and flat lighting. Used-view history persists per character in a JSON file across workflow runs and restarts; when all views are exhausted it cycles. Never cached — every queue produces the next prompt.
+
+| Input | Description |
+|---|---|
+| `character_name` | Key for the history file (one JSON per character) |
+| `character_description` | Appearance text inserted into every prompt |
+| `mode` | `sequential` picks views in order; `random` uses seed + run count |
+| `seed` | Random mode only |
+| `reset` | Clear this character's history and start over |
+
+**Outputs:** `prompt`, `remaining`, `total`, `view_key`
 
 ---
 
