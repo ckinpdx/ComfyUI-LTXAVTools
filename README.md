@@ -156,6 +156,8 @@ Displays an image preview and passes the image through unchanged. Useful inside 
 
 Temporal (and optionally spatial) tiling sampler for long-form video+audio generation with the LTX2.3 AV model. Generates video and audio jointly as a NestedTensor latent across multiple overlapping chunks, accumulating a coherent sequence longer than any single context window.
 
+**See [LOOPING_SAMPLER_GUIDE.md](LOOPING_SAMPLER_GUIDE.md)** for the field guide: how the input levers interact across modalities, generation regimes, recipes, and a symptom→lever troubleshooting table.
+
 Input latent must be an AV NestedTensor sized to the full output — the video component defines resolution and frame count, the audio component the matching audio length. Build it with the core `LTXVConcatAVLatent` node (video latent + audio latent), an AV VAE encode, or `LTX AV Extend Latent`. Do **not** use `LTX Audio Only Latent` here — its video component is a 1-frame dummy intended for audio-only generation. Use `LTXVLoopingSampler` (ComfyUI-LTXVideo) for video-only generation.
 
 **Output:** `denoised_output` — AV NestedTensor LATENT
@@ -174,8 +176,8 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `temporal_tile_size` | 80 | Pixel frames per temporal chunk. Multiple of 8, minimum 24. |
 | `temporal_overlap` | 24 | Pixel frames of overlap between chunks. The overlapping region from the previous chunk is injected as a guide so the model maintains visual continuity. |
 | `guiding_strength` | 1.0 | Conditioning strength for guiding latents (IC-LoRA / latent guides). |
-| `temporal_overlap_cond_strength` | 0.5 | Noise mask strength for the video carry-over (overlap) region. Higher values hold the overlap more rigidly; lower values let the model blend more freely. |
-| `audio_overlap_cond_strength` | 0.9 | Noise mask strength for the audio carry-over region. Try 0.9–1.0 if chunk boundaries sound rough. |
+| `temporal_overlap_cond_strength` | 1.0 | Noise mask strength for the video carry-over (overlap) region. Keep at 1.0 for AV generation — frozen symmetric context (video and audio both 1.0) is what holds lipsync across chunks. |
+| `audio_overlap_cond_strength` | 1.0 | Noise mask strength for the audio carry-over region. Keep at 1.0, matching the video overlap — asymmetric anchors cause per-chunk lipsync dropout. |
 | `cond_image_strength` | 1.0 | Noise mask strength for image keyframe conditioning. |
 | `horizontal_tiles` | 1 | Number of spatial tiles horizontally. |
 | `vertical_tiles` | 1 | Number of spatial tiles vertically. Audio is accumulated from tile (0,0) only. |
@@ -202,7 +204,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 Audio continuity across chunk boundaries is maintained through two complementary mechanisms:
 
 1. **Noise mask carry-over** — the last N audio frames from the accumulated output are carried into each chunk's init latent with a strong conditioning mask (`audio_overlap_cond_strength`).
-2. **Bridge stitching** — when stitching, the accumulated audio tail is replaced by the model's own regenerated carry-over rather than hard-concatenated, avoiding spectral discontinuities at boundaries. The chunk's first audio frame (the first-frame-asymmetry stub) is dropped and one tail frame padded to preserve exact length.
+2. **Bridge stitching** — when stitching, the accumulated audio tail is replaced by the model's own regenerated carry-over rather than hard-concatenated, avoiding spectral discontinuities at boundaries. The carry length `(overlap − 1) × 8 + 1` absorbs the first-frame asymmetry, so chunk audio is stitched without trimming or padding.
 
 For voice identity continuity across separate generations, use `LTX Add Audio Latent Guide` to inject reference audio at the conditioning level.
 

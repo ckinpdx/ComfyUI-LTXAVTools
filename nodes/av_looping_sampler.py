@@ -7,8 +7,9 @@ Temporal tiling with audio overlap carry-over maintains continuity across chunks
 Audio alignment notes:
   - AUDIO_LATENTS_PER_SECOND = 25.0 (fixed for LTX AV)
   - First video latent = 1 pixel frame; subsequent = 8 pixel frames (LTX asymmetry)
-  - Each extend chunk generates 7 fewer audio frames than the global timeline expects
-    due to the first-frame treatment. Fixed by: drop 1 audio frame (frame 0) + pad 1.
+  - Each extend chunk generates (overlap-1)*8+1 carry + num_new*8 new audio frames.
+    The carry length itself absorbs the first-frame treatment, so chunk audio is
+    stitched as-is — local frame 0 is real content, not a stub (unlike video).
 
 Spatial tiling with AV: audio accumulated from tile (0,0) only.
 """
@@ -160,14 +161,19 @@ class LTXVAVLoopingSampler:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                 }),
                 "temporal_overlap_cond_strength": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Noise mask strength for video overlap carry-over region.",
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Noise mask strength for video overlap carry-over region. "
+                               "Keep at 1.0 for AV generation — the frozen symmetric "
+                               "context (video and audio both 1.0) is what holds lipsync "
+                               "across chunks. Lower values let the model rewrite the "
+                               "seam and the modalities can decouple.",
                 }),
                 "audio_overlap_cond_strength": ("FLOAT", {
-                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Noise mask strength for audio overlap carry-over. "
-                               "Higher values freeze the carry-over region more strongly. "
-                               "Try 0.9-1.0 if chunk boundaries sound rough.",
+                               "Keep at 1.0, matching the video overlap strength — "
+                               "asymmetric anchors are the main cause of per-chunk "
+                               "lipsync dropout.",
                 }),
                 "cond_image_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -184,6 +190,12 @@ class LTXVAVLoopingSampler:
                 "optional_cond_images":            ("IMAGE",),
                 "optional_guiding_latents":        ("LATENT",),
                 "optional_negative_index_latents": ("LATENT",),
+                "optional_negative_index_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Conditioning strength for the negative-index reference "
+                               "latents. Lower values reduce pose/lighting bleed from "
+                               "the reference into the generation.",
+                }),
                 "optional_positive_conditionings": ("CONDITIONING",),
                 "optional_normalizing_latents":    ("LATENT",),
                 "adain_factor": ("FLOAT", {
@@ -623,11 +635,13 @@ class LTXVAVLoopingSampler:
         )
 
         # --- stitch audio ---
-        # Drop frame 0 (first-frame asymmetry stub), pad 1 to restore exact
-        # T_a_chunk length (drop-1 leaves T_a_chunk-1; we need T_a_chunk).
-        audio_trimmed = audio_out[:, :, 1:, :]
-        pad1 = audio_trimmed[:, :, -1:, :]
-        audio_body = torch.cat([audio_trimmed, pad1], dim=2)  # T_a_chunk frames
+        # Unlike video, local audio frame 0 is real content (one 40ms frame
+        # paired with the 1-px first latent), not a stub. The carry length
+        # a_overlap = (overlap-1)*8+1 already accounts for the first-frame
+        # asymmetry, so the chunk's T_a_chunk frames drop into the timeline
+        # as-is. The old drop-1/pad-1 deleted one frame per boundary: an
+        # audible stutter at every join and -40ms/chunk cumulative AV drift.
+        audio_body = audio_out  # T_a_chunk frames
 
         # Use model's regenerated carry-over as the bridge rather than hard-joining
         # audio_acc's tail to the new frames. The model generated audio_body as one
@@ -769,7 +783,7 @@ class LTXVAVLoopingSampler:
         temporal_tile_size, temporal_overlap, temporal_overlap_cond_strength,
         horizontal_tiles, vertical_tiles, spatial_overlap,
         video_fps=25.0,
-        audio_overlap_cond_strength=0.9,
+        audio_overlap_cond_strength=1.0,
         audio_cond_strength=0.0,
         optional_cond_images=None, cond_image_strength=1.0,
         optional_guiding_latents=None,
