@@ -38,15 +38,26 @@ Three structural facts drive almost every tuning decision:
 
 ## 2. Temporal structure
 
-### `temporal_tile_size`, `temporal_overlap`
+### `temporal_tile_size`, `temporal_overlap`, `scene_lengths`
 
-Chunk math (pixel frames): chunk 0 covers `tile_size`; every extend chunk adds
-`tile_size − temporal_overlap` new frames while re-seeing the last `temporal_overlap`.
-At 25 fps with tile 248 / overlap 48: chunk 0 ≈ 10 s, boundaries every 8 s.
+Chunk math (pixel frames): **every chunk — including chunk 0 — delivers one
+`tile_size` of new content**; extend chunks additionally re-see the last
+`temporal_overlap` as frozen context (their sampled window is `overlap + tile`).
+At 25 fps with tile 248 / overlap 48: one prompt segment ≈ 10 s of footage,
+uniformly. The loop walks this schedule exactly and stops when the timeline is
+covered (the last chunk clamps to the remainder — size totals as multiples of
+the tile to avoid a short tail beat).
 
-- **New-content budget per chunk** = `(tile_size − overlap) / fps` seconds. This is the
-  dialog budget: a spoken line must fit inside its chunk's budget (~20 words per 8 s) or
-  it gets cut off and the next chunk won't finish it.
+`scene_lengths` (pipe/comma-separated pixel-frame counts, multiples of 8)
+replaces the uniform tile with per-chunk scene lengths — a 4 s punchy beat and
+a 14 s monologue beat in one run, prompts mapping 1:1 to scenes. Use the
+**LTX Scene Length Calculator** to author scenes in seconds; it emits the
+snapped `scene_lengths` string *and* the exactly-matching `frame_count` for the
+empty latent, so the schedule and the canvas cannot disagree.
+
+- **New-content budget per chunk** = `tile_size / fps` seconds (or that scene's
+  length). This is the dialog budget: a spoken line must fit inside its chunk's
+  budget or it gets cut off and the next chunk won't finish it.
 - **Overlap is the context window.** ~2 s (48 px) is a validated sweet spot: enough
   evidence of "speech mid-stream / motion mid-arc" without spending the whole tile
   re-generating known content.
@@ -206,6 +217,40 @@ prompt format `[VISUAL]: … [SPEECH]: exact words [SOUNDS]: voice style + ambie
 keep the `[SOUNDS]` voice descriptor identical across segments. The sampler carries
 `ref_audio` onto per-chunk prompts automatically.
 
+### Multi-speaker dialog (turn-based)
+
+`LTX AV Reference Audio Multi (ID-LoRA)` + `LTX AV Speaker Prompt Provider` extend
+ID-LoRA voice locking to up to four speakers, one per chunk. In the script, write
+`[SPEAKER n]:` in place of `[SPEECH]:` — the provider records the routing and rewrites
+the tag to `[SPEECH]:` before encoding, so every chunk is individually in-convention
+for the LoRA; the multi-speaker structure exists only in the scheduler. Rules:
+
+- **One speaker per chunk.** Overlapping/simultaneous speech needs trained per-token
+  binding (MultiTalk-class) and is out of scope.
+- **`[SPEECH]` content must be in spoken register.** The alignment was trained on
+  people talking; written-register prose (definitions, gerund chains, nominalizations)
+  garbles as repeated/rearranged words regardless of speaker. Read the line aloud —
+  if it's stiff to say, it will garble. Keep lines inside the chunk's budget
+  (~2.5 words/sec) with margin. **Punctuation: periods, commas, and question marks
+  only — never dashes** (typographic, not phonetic; speech parsing mishandles them).
+- **`[SOUNDS]` is one flat declarative sentence about the speaker**, matching the
+  trained register: `The speaker has a clear, assured female voice with a
+  conversational tone.` Identical across that speaker's turns. No fragment chains,
+  no ambient-event lists, no temporal narration — stylized clauses like "then a beat
+  of quiet" are off-register and their words can leak into the spoken audio
+  (observed: a run spoke the word "beat").
+- **`[VISUAL]` must bind the voice to the right face**: both character blocks appear
+  verbatim in every segment; the speaker gets the articulation clause; the listener is
+  described through gaze and stillness only (never mouth state).
+- **Turn-boundary containment**: if a turn misbehaves, the frozen context faithfully
+  propagates the damage ~2 chunks before self-recovery. The tool is
+  `per_tile_seed_offsets` (`0,0,7` = re-roll chunk 2 only) — re-roll the originating
+  chunk. Do **not** attempt to loosen the audio carry at boundaries: audio freedom in
+  a region where video is frozen lets the model start the new line under the previous
+  speaker's face (tried and removed).
+- Untagged `[SPEECH]:` segments fall back to speaker 1 — single-voice scripts run
+  unmodified.
+
 ---
 
 ## 7. Motion guidance (IC-LoRA)
@@ -222,6 +267,24 @@ steps lets textures diverge from the guide. The sampler splits the schedule and 
 segments back-to-back.
 
 ---
+
+## 7b. Dual-sampler schedules (phase 2)
+
+`optional_phase2_sampler` + `optional_phase2_guider` + `phase2_start_step` reproduce
+the dual-sampler pattern (heavy solver for structure, cheap solver for refinement)
+inside every chunk. Example, porting a Clownshark KSampler → ChainSampler pair:
+
+- Your custom schedule (e.g. Linear Quadratic Advanced) → `sigmas`
+- Phase 1: ClownSampler (etdrk2_2s, eta 0.5, options) → `sampler`; CFGGuider @2.0 → `guider`
+- Phase 2: ClownSampler (euler, eta 0) → `optional_phase2_sampler`; CFGGuider @1.0 → `optional_phase2_guider`
+- `steps_to_run 4` → `phase2_start_step = 4`
+
+The handoff is resample-style continuation (re-noise the current estimate at the
+segment's first sigma), matching ChainSampler's `resample` mode. The phase-2
+guider's own conditioning is discarded — it inherits the chunk's full conditioning
+(per-chunk prompt, guides, keyframes, ref_audio); only its guidance settings (cfg)
+apply. Near-facsimile, not bit-exact: solver-internal state does not cross the
+phase boundary.
 
 ## 8. Statistics and drift
 
@@ -271,10 +334,10 @@ motion, framing, pacing. Stage 2 (latent-upsampled, denoise ≈ 0.3, `audio_cond
 ## 11. Seeds
 
 Per-chunk seeds derive from the base seed + chunk position, so a re-run with the same
-seed reproduces every chunk. The hidden `per_tile_seed_offsets` parameter (comma-separated
-ints, indexed by temporal chunk) can re-roll a single chunk without touching the others —
-e.g. `"0,0,7"` re-rolls only chunk 2. Currently code-level only (not exposed as a widget);
-expose it if surgical re-rolls become routine.
+seed reproduces every chunk. `per_tile_seed_offsets` (widget; comma-separated ints,
+indexed by temporal chunk) re-rolls a single chunk without touching the others —
+e.g. `"0,0,7"` re-rolls only chunk 2. The surgical fix for one bad chunk in an
+otherwise good run.
 
 ---
 
@@ -326,3 +389,5 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Chunks open pulled toward the reference's pose | lower `optional_negative_index_strength`; stack order |
 | Faint hum after the input track ends | zeros-tail pseudo-silence — match lengths or pad with encoded silence |
 | Mouth stays clamped shut during speech | closed-mouth language in the prompt ("lips settle closed", "mouth still") — remove; license pauses via gaze only |
+| Speech garbled: words present but repeated/rearranged | written-register `[SPEECH]` line — rewrite in spoken register (read it aloud) |
+| Stray word spoken at a turn's end, next 1–2 chunks garbled | `[SOUNDS]` vocabulary leak + carry contagion — flatten `[SOUNDS]` to the declarative register; re-roll the origin chunk via `per_tile_seed_offsets` |

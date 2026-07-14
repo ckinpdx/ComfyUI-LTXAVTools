@@ -29,6 +29,18 @@ Snaps a desired duration to the nearest valid LTX frame count — `(frames - 1) 
 
 `clean_frame_count` and `clean_latent_frames` exclude the extra frames — use these as trim targets when stripping a contamination buffer.
 
+### LTX Scene Length Calculator
+Authors variable scene lengths for the AV Looping Sampler. Takes scene durations in seconds (`10 | 4.5 | 12.2`), snaps each to latent granularity (multiples of 8 pixel frames), and outputs the `scene_lengths` string for the sampler **and** the exactly-matching total `frame_count` for the empty latent — single source of truth, so schedule and canvas cannot disagree.
+
+| Input | Description |
+|---|---|
+| `scene_seconds` | Scene durations in seconds, `\|` or `,` separated — one per chunk/prompt segment |
+| `fps` | Frames per second (25 for AV) |
+
+**Outputs:** `scene_lengths`, `frame_count`, `scene_count`, `info`, `actual_seconds`
+
+`actual_seconds` (= `frame_count / fps`) matches the LTX Frame Calculator convention — use it to trim input audio to the exact video duration in conditioned-audio workflows.
+
 ---
 
 ### LTX Audio Latent Trim
@@ -96,6 +108,23 @@ Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` f
 Removes `ref_audio` from conditioning after sampling. Pair with LTX Add Audio Latent Guide — call after the sampler so a stale audio reference doesn't leak into subsequent passes. No latent trimming is needed (audio guides don't append tokens to the latent).
 
 **Inputs:** `positive`, `negative` — **Outputs:** `positive`, `negative`
+
+### LTX AV Reference Audio Multi (ID-LoRA)
+Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four reference voices (~5 s clean clips). Speaker 1 is applied as the default `ref_audio` and the identity-guidance model patch is identical to the core node — with a single reference this is a drop-in replacement. All encoded voices are attached to the positive conditioning as a `ref_audio_bank`, which the AV Looping Sampler reads to switch voices per chunk.
+
+| Input | Description |
+|---|---|
+| `model`, `positive`, `negative` | passed through (model cloned + patched) |
+| `audio_vae` | LTXV audio VAE |
+| `reference_audio_1` | Speaker 1 — default voice (required) |
+| `reference_audio_2..4` | Additional speakers (optional) |
+| `identity_guidance_scale` | Extra no-reference pass per step amplifies speaker identity; 0 disables |
+| `start_percent` / `end_percent` | Sigma range where identity guidance is active |
+
+### LTX AV Speaker Prompt Provider
+`MultiPromptProvider` with voice routing for multi-speaker ID-LoRA generation. Splits prompts on `|` (one per temporal chunk). Segments using `[SPEAKER n]:` in place of `[SPEECH]:` select voice *n* from the reference bank for that chunk; the tag is rewritten to `[SPEECH]:` **before** encoding, so the model only ever sees its trained format. Untagged segments use the default voice. One speaker per chunk — turn-based dialog only.
+
+**Inputs:** `prompts`, `clip` — **Output:** `conditionings` (wire to `optional_positive_conditionings`)
 
 ---
 
@@ -196,6 +225,11 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `optional_normalizing_latents` | — | Reference latent for AdaIN normalization. When provided, each chunk's channel statistics are normalized per-frame to match this reference. |
 | `adain_factor` | 0.0 | Strength of AdaIN (Adaptive Instance Normalization) applied to each chunk's output. Counteracts tonal drift and overbaking of static regions in long sequences. `0.0` = off. With `optional_normalizing_latents`: per-frame per-channel normalization. Without: uses the first chunk's output as a global channel reference. |
 | `audio_cond_strength` | 0.0 | Strength of conditioning on the input audio latent. `0.0` = ignore input audio, generate freely. `1.0` = fully hold the input audio. Intermediate values allow guided regeneration. |
+| `scene_lengths` | `""` | Optional pipe/comma-separated pixel-frame counts (multiples of 8), one per chunk, for variable scene lengths. Empty = uniform `temporal_tile_size` chunks. Prompts map 1:1 to scenes. Pair with LTX Scene Length Calculator. |
+| `per_tile_seed_offsets` | `"0"` | Comma-separated per-chunk seed offsets. A nonzero entry re-rolls only that chunk's noise (`0,0,7` re-rolls chunk 2) — surgical fix for one bad chunk. |
+| `optional_phase2_sampler` | — | Second-phase sampler for dual-sampler schedules. Takes over at `phase2_start_step` within every chunk, resample-style continuation (Clownshark-chain pattern). |
+| `optional_phase2_guider` | — | Guider for phase 2 (e.g. CFG 1.0 vs. phase 1's 2.0). Its conditioning is replaced by the chunk's; only guidance settings apply. Falls back to the main guider. |
+| `phase2_start_step` | 0 | Schedule step where phase 2 takes over. 0 = disabled. |
 | `guiding_start_step` | 0 | Sigma schedule step at which guiding latents begin influencing. |
 | `guiding_end_step` | 1000 | Sigma schedule step at which guiding latents stop influencing. |
 

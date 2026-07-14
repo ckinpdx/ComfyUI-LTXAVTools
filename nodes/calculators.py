@@ -236,14 +236,66 @@ if _HAS_SERVER:
         return web.json_response(_build_options(ratio_long, ratio_short, landscape, grid=grid))
 
 
+class LTXSceneLengthCalculator:
+    """
+    Converts a pipe/comma-separated list of scene durations (seconds) into the
+    scene_lengths string for the AV Looping Sampler plus the exactly-matching
+    total frame_count for the empty latent. Single source of truth: the sampler
+    schedule and the latent length cannot disagree.
+
+    Each scene snaps to latent granularity (multiples of 8 pixel frames).
+    Total frame_count = (sum_of_scene_latents - 1) * 8 + 1.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "scene_seconds": ("STRING", {
+                    "multiline": True,
+                    "default": "10 | 10 | 10",
+                    "tooltip": "Scene durations in seconds, separated by '|' or ','. "
+                               "One scene per chunk / prompt segment.",
+                }),
+                "fps": ("FLOAT", {
+                    "default": 25.0, "min": 1.0, "max": 120.0, "step": 0.01,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING", "FLOAT")
+    RETURN_NAMES = ("scene_lengths", "frame_count", "scene_count", "info", "actual_seconds")
+    FUNCTION     = "calc"
+    CATEGORY     = "LTXAVTools/calculators"
+
+    def calc(self, scene_seconds, fps):
+        parts = [p.strip() for p in scene_seconds.replace(",", "|").split("|") if p.strip()]
+        if not parts:
+            raise ValueError("[LTXSceneLengthCalculator] No scene durations provided.")
+
+        px_list = [max(8, int(round(float(p) * fps / 8)) * 8) for p in parts]
+        total_latents = sum(px // 8 for px in px_list)
+        frame_count   = (total_latents - 1) * 8 + 1
+        actual_seconds = frame_count / fps
+
+        scene_lengths = "|".join(str(px) for px in px_list)
+        info = " + ".join(f"{px}px ({px / fps:.2f}s)" for px in px_list)
+        info = f"{info} = {frame_count} frames ({actual_seconds:.2f}s)"
+        print(f"[LTXSceneLengthCalculator] {info}")
+
+        return (scene_lengths, frame_count, len(px_list), info, actual_seconds)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXDimensionCalculator":       LTXDimensionCalculator,
     "LTXDimensionCalculator3Stage": LTXDimensionCalculator3Stage,
     "LTXFrameCalculator":           LTXFrameCalculator,
+    "LTXSceneLengthCalculator":     LTXSceneLengthCalculator,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXDimensionCalculator":       "LTX Dimension Calculator",
     "LTXDimensionCalculator3Stage": "LTX Dimension Calculator 3 Stage",
     "LTXFrameCalculator":           "LTX Frame Calculator",
+    "LTXSceneLengthCalculator":     "LTX Scene Length Calculator",
 }

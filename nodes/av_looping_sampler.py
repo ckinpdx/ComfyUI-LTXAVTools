@@ -211,6 +211,39 @@ class LTXVAVLoopingSampler:
                                "1.0 = fully condition on input audio (no regeneration). "
                                "Only active when the input AV latent contains non-zero audio.",
                 }),
+                "scene_lengths": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional pipe/comma-separated pixel-frame counts, one per "
+                               "chunk (multiples of 8), for variable scene lengths. Empty = "
+                               "uniform temporal_tile_size chunks. Prompts map 1:1 to scenes; "
+                               "the last value repeats if the video is longer than the list. "
+                               "Pair with LTX Scene Length Calculator.",
+                }),
+                "per_tile_seed_offsets": ("STRING", {
+                    "default": "0",
+                    "tooltip": "Comma-separated per-chunk seed offsets, indexed by temporal "
+                               "chunk. A nonzero entry re-rolls only that chunk's noise: "
+                               "'0,0,7' re-rolls chunk 2 and leaves all others identical. "
+                               "Surgical fix for one bad chunk in an otherwise good run.",
+                }),
+                "optional_phase2_sampler": ("SAMPLER", {
+                    "tooltip": "Second-phase sampler for dual-sampler schedules (e.g. a "
+                               "heavy solver for the first steps, euler for the rest). "
+                               "Takes over at phase2_start_step within every chunk's "
+                               "schedule, resample-style continuation.",
+                }),
+                "optional_phase2_guider": ("GUIDER", {
+                    "tooltip": "Guider for the second phase (e.g. CFG 1.0 while phase 1 "
+                               "runs CFG 2.0). Its conditioning is replaced with the "
+                               "chunk's conditioning; only its guidance settings apply. "
+                               "Falls back to the main guider if unconnected.",
+                }),
+                "phase2_start_step": ("INT", {
+                    "default": 0, "min": 0, "max": 1000,
+                    "tooltip": "Schedule step where phase 2 takes over (0 = disabled). "
+                               "E.g. 4 on a 12-step schedule: steps 0-3 use the main "
+                               "sampler/guider, steps 4+ use the phase-2 pair.",
+                }),
             },
         }
 
@@ -275,6 +308,19 @@ class LTXVAVLoopingSampler:
         positive, negative = _append_guide_attention_entry(
             positive, negative, pre_filter_count, list(guide.shape[2:]), strength,
         )
+
+        kf_tokens = 0
+        for t in positive:
+            kf = t[1].get("keyframe_idxs")
+            if kf is not None:
+                kf_tokens = kf.shape[2]
+                break
+        print(
+            f"[LTXVAVLoopingSampler] guide appended: {guide.shape[2]} latents "
+            f"({guide.shape[3]}x{guide.shape[4]}) at latent_idx {latent_idx} "
+            f"(frame_idx {frame_idx}) strength {strength} | latent T now "
+            f"{latent_tensor.shape[2]} | keyframe tokens now {kf_tokens}"
+        )
         return positive, negative, {"samples": latent_tensor, "noise_mask": noise_mask}
 
     def _build_av_noise_mask(self, video_latent_dict, audio_mask_tensor, ltxav):
@@ -283,15 +329,44 @@ class LTXVAVLoopingSampler:
         return NestedTensor(ltxav.recombine_audio_and_video_latents(vm, audio_mask_tensor))
 
     def _run_sampling(self, noise, guider, sampler, sigmas,
-                      av_init, guiding_start_step, guiding_end_step):
-        high, rest = SplitSigmas().get_sigmas(sigmas, guiding_start_step)
-        mid,  low  = SplitSigmas().get_sigmas(rest, guiding_end_step - guiding_start_step)
+                      av_init, guiding_start_step, guiding_end_step,
+                      phase2_sampler=None, phase2_guider=None, phase2_start_step=0):
+        """
+        Run the schedule as sequential resample-continuation segments.
+        Split points: guiding_start_step (guide windowing) and, when a phase-2
+        sampler is provided, phase2_start_step — where the sampler/guider pair
+        switches (dual-sampler schedules a la Clownshark chain, resample mode).
+        Steps beyond guiding_end_step are discarded (pre-existing behavior).
+        """
+        use_phase2 = phase2_sampler is not None and phase2_start_step > 0
+        end_step = guiding_end_step
+
+        cut_points = {guiding_start_step}
+        if use_phase2:
+            cut_points.add(phase2_start_step)
+        cut_points = sorted(p for p in cut_points if 0 < p < end_step)
+
+        segments = []
+        remaining = sigmas
+        prev = 0
+        for p in cut_points:
+            seg, remaining = SplitSigmas().get_sigmas(remaining, p - prev)
+            segments.append((prev, seg))
+            prev = p
+        tail, _ = SplitSigmas().get_sigmas(remaining, end_step - prev)
+        segments.append((prev, tail))
 
         current = av_init
-        if len(high) > 1:
-            _, current = SamplerCustomAdvanced().sample(noise, guider, sampler, high, current)
-        if len(mid) > 1:
-            _, current = SamplerCustomAdvanced().sample(noise, guider, sampler, mid,  current)
+        for seg_start, seg_sigmas in segments:
+            if len(seg_sigmas) <= 1:
+                continue
+            seg_sampler, seg_guider = sampler, guider
+            if use_phase2 and seg_start >= phase2_start_step:
+                seg_sampler = phase2_sampler
+                seg_guider  = phase2_guider if phase2_guider is not None else guider
+            _, current = SamplerCustomAdvanced().sample(
+                noise, seg_guider, seg_sampler, seg_sigmas, current
+            )
         return current
 
     def _crop_and_split(self, av_latent_dict, positive, negative, ltxav):
@@ -306,8 +381,23 @@ class LTXVAVLoopingSampler:
             video_raw = samples
             audio_out = None
 
+        kf_tokens = 0
+        for t in positive:
+            kf = t[1].get("keyframe_idxs")
+            if kf is not None:
+                kf_tokens = kf.shape[2]
+                break
+        tpf = video_raw.shape[3] * video_raw.shape[4]
+
         positive, negative, video_cropped = LTXVCropGuides.execute(
             positive, negative, {"samples": video_raw}
+        )
+        print(
+            f"[LTXVAVLoopingSampler] crop: T_in={video_raw.shape[2]} | "
+            f"keyframe_tokens={kf_tokens} | tokens_per_frame={tpf} "
+            f"(H={video_raw.shape[3]}, W={video_raw.shape[4]}) | "
+            f"trim={kf_tokens // tpf if tpf else 0} | "
+            f"T_out={video_cropped['samples'].shape[2]}"
         )
         return video_cropped["samples"], audio_out, positive, negative
 
@@ -345,43 +435,79 @@ class LTXVAVLoopingSampler:
         positive, negative = _get_raw_conds(guider)
         idx = min(chunk_index, len(optional_positive_conditionings) - 1)
         chunk_pos = optional_positive_conditionings[idx]
+        chunk_neg = negative
         # Per-chunk prompts are encoded from bare text and lack conditioning-level
         # values set upstream (e.g. ref_audio from LTXVReferenceAudio / ID-LoRA).
-        # Carry them over from the base positive, otherwise identity guidance
-        # nulls out (cond == no-ref cond) while still paying its extra pass.
-        ref_audio = positive[0][1].get("ref_audio")
+        # Resolve this chunk's voice: [SPEAKER n] routing first (speaker_idx
+        # stamped by LTXAVSpeakerPromptProvider + ref_audio_bank attached by
+        # LTXAVReferenceAudioMulti), then fall back to the base ref_audio.
+        # Without the carry-over, identity guidance nulls out (cond == no-ref
+        # cond) while still paying its extra forward pass.
+        base_vals   = positive[0][1]
+        bank        = base_vals.get("ref_audio_bank")
+        speaker_idx = chunk_pos[0][1].get("speaker_idx") if chunk_pos else None
+        ref_audio   = None
+        if speaker_idx is not None and bank:
+            ref_audio = bank.get(speaker_idx)
+            if ref_audio is None:
+                print(
+                    f"[LTXVAVLoopingSampler] chunk {chunk_index}: [SPEAKER {speaker_idx}] "
+                    f"has no reference in the bank (have {sorted(bank)}); using default voice."
+                )
+        ref_source = "bank"
+        if ref_audio is None:
+            ref_audio = base_vals.get("ref_audio")
+            ref_source = "base" if ref_audio is not None else "none"
+        print(
+            f"[LTXVAVLoopingSampler] chunk {chunk_index}: "
+            f"speaker={speaker_idx if speaker_idx is not None else 'untagged'} "
+            f"ref={ref_source}"
+        )
         if ref_audio is not None:
-            chunk_pos = node_helpers.conditioning_set_values(chunk_pos, {"ref_audio": ref_audio})
-        new_g.set_conds(chunk_pos, negative)
-        new_g.raw_conds = (chunk_pos, negative)
+            # speaker_idx is routing metadata — cleared so it never reaches the model
+            chunk_pos = node_helpers.conditioning_set_values(
+                chunk_pos, {"ref_audio": ref_audio, "speaker_idx": None}
+            )
+            chunk_neg = node_helpers.conditioning_set_values(
+                negative, {"ref_audio": ref_audio}
+            )
+        new_g.set_conds(chunk_pos, chunk_neg)
+        new_g.raw_conds = (chunk_pos, chunk_neg)
         return new_g
 
     def _calculate_keyframe_per_tile_indices(self, keyframe_indices,
-                                              temporal_tile_size, temporal_overlap,
-                                              num_frames):
+                                              chunk_schedule, temporal_overlap,
+                                              time_scale):
+        """
+        Map global keyframe pixel indices onto the chunk schedule.
+        Returns (chunk_index, in_chunk_pixel_index) pairs.
+
+        Chunk k's new content covers global latents [bounds[k-1], bounds[k]).
+        An extend chunk's local latent 0 sits at global latent
+        bounds[k-1] - temporal_overlap, so local pixel x maps to global pixel
+        (bounds[k-1] - temporal_overlap) * time_scale + x.
+        """
+        bounds = []
+        c = 0
+        for n in chunk_schedule:
+            c += n
+            bounds.append(c)
+        total_px = (c - 1) * time_scale + 1
+
         result = []
         for kf in keyframe_indices:
-            if kf >= num_frames:
+            if kf < 0 or kf >= total_px:
                 continue
-            if kf < temporal_tile_size - 7:
-                result.append((0, kf))
-                continue
-            tile_step  = temporal_tile_size - temporal_overlap
-            tile_index = 1
-            while True:
-                tile_start = tile_index * tile_step - 7
-                tile_end   = temporal_tile_size + tile_index * tile_step - 1 - 7
-                if kf <= tile_end:
-                    in_tile = kf - tile_start - 7
-                    if in_tile < temporal_overlap:
-                        tile_index -= 1
-                        if tile_index == 0:
-                            in_tile = kf
-                        else:
-                            in_tile = kf - (tile_start - tile_step) - 7
-                    result.append((tile_index, in_tile))
+            owner_latent = (kf + time_scale - 1) // time_scale
+            for t_idx, end in enumerate(bounds):
+                if owner_latent < end:
+                    if t_idx == 0:
+                        in_tile = kf
+                    else:
+                        win_start_latent = bounds[t_idx - 1] - temporal_overlap
+                        in_tile = kf - win_start_latent * time_scale
+                    result.append((t_idx, in_tile))
                     break
-                tile_index += 1
         return result
 
     # ------------------------------------------------------------------ #
@@ -400,6 +526,7 @@ class LTXVAVLoopingSampler:
         keyframes, kf_idx_str,
         audio_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
+        phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -468,18 +595,29 @@ class LTXVAVLoopingSampler:
 
         video_has_mask = "noise_mask" in video_init and video_init["noise_mask"] is not None
         av_init = {"samples": self._combine_av(video_init["samples"], audio_init, ltxav)}
-        if video_has_mask or audio_cond_strength > 0.0:
-            if not video_has_mask:
-                # need a paired video mask (all-ones = full denoising for video)
-                video_init["noise_mask"] = torch.ones(
-                    B, 1, T_v, 1, 1,
-                    device=video_init["samples"].device, dtype=video_init["samples"].dtype,
-                )
-            av_init["noise_mask"] = self._build_av_noise_mask(video_init, audio_mask, ltxav)
+        # Always attach a noise mask (all-ones = full denoising, semantically a
+        # no-op). External conditioning can carry keyframe_idxs (e.g. IC-LoRA
+        # guide nodes), and the model patchifies denoise_mask unguarded when
+        # keyframes are present — a maskless chunk hard-crashes on patchify(None).
+        if not video_has_mask:
+            video_init["noise_mask"] = torch.ones(
+                B, 1, T_v, 1, 1,
+                device=video_init["samples"].device, dtype=video_init["samples"].dtype,
+            )
+        av_init["noise_mask"] = self._build_av_noise_mask(video_init, audio_mask, ltxav)
 
         guider.set_conds(positive, negative)
+        if phase2_guider is not None:
+            # Phase-2 guider contributes its guidance settings (e.g. cfg) only;
+            # it must carry this chunk's full conditioning (guides, keyframes,
+            # ref_audio) or the second phase would sample against stale conds.
+            phase2_guider = copy.copy(phase2_guider)
+            phase2_guider.set_conds(positive, negative)
         av_out = self._run_sampling(noise, guider, sampler, sigmas, av_init,
-                                    guiding_start_step, guiding_end_step)
+                                    guiding_start_step, guiding_end_step,
+                                    phase2_sampler=phase2_sampler,
+                                    phase2_guider=phase2_guider,
+                                    phase2_start_step=phase2_start_step)
 
         video_out, audio_out, pos_out, neg_out = self._crop_and_split(
             av_out, positive, negative, ltxav
@@ -509,6 +647,7 @@ class LTXVAVLoopingSampler:
         chunk_index,
         audio_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
+        phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -625,8 +764,17 @@ class LTXVAVLoopingSampler:
         av_init["noise_mask"] = self._build_av_noise_mask(video_init, audio_mask, ltxav)
 
         guider.set_conds(positive, negative)
+        if phase2_guider is not None:
+            # Phase-2 guider contributes its guidance settings (e.g. cfg) only;
+            # it must carry this chunk's full conditioning (guides, keyframes,
+            # ref_audio) or the second phase would sample against stale conds.
+            phase2_guider = copy.copy(phase2_guider)
+            phase2_guider.set_conds(positive, negative)
         av_out = self._run_sampling(noise, guider, sampler, sigmas, av_init,
-                                    guiding_start_step, guiding_end_step)
+                                    guiding_start_step, guiding_end_step,
+                                    phase2_sampler=phase2_sampler,
+                                    phase2_guider=phase2_guider,
+                                    phase2_start_step=phase2_start_step)
 
         video_out, audio_out, _, _ = self._crop_and_split(av_out, positive, negative, ltxav)
 
@@ -672,7 +820,7 @@ class LTXVAVLoopingSampler:
         video_tile_latent, audio_full, ltxav,
         time_scale, width_scale, height_scale,
         tile_h, tile_w,
-        temporal_tile_size, temporal_overlap, fps,
+        chunk_schedule, temporal_overlap, fps,
         overlap_cond_strength,
         audio_overlap_cond_strength,
         cond_images, cond_image_strength,
@@ -685,20 +833,24 @@ class LTXVAVLoopingSampler:
         per_tile_seed_offsets,
         audio_cond_strength=0.0,
         adain_factor=0.0, normalizing_latents=None,
+        phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
-        step = temporal_tile_size - temporal_overlap
         video_acc    = None
         audio_acc    = None
         chunk_idx    = 0
         adain_ref    = None   # set after first chunk; used as fallback when no normalizing_latents
         adain_per_frame = normalizing_latents is not None
 
-        starts = range(0, T_v + step, step)
-        ends   = range(temporal_tile_size, T_v + temporal_tile_size, step)
-
-        for i_t, (v_start, v_end) in enumerate(zip(starts, ends)):
-            v_end = min(v_end, T_v)
+        # Schedule-driven loop: v_start walks the accumulator's real position
+        # (v_start == n_acc for every extend chunk), so guide slices, normalizing
+        # slices, and keyframe routing all index the same timeline, and the loop
+        # terminates exactly when the video is covered.
+        cum = 0
+        for i_t, n_new in enumerate(chunk_schedule):
+            v_start = cum
+            v_end   = min(v_start + n_new, T_v)
+            cum     = v_end
             if v_start >= T_v:
                 break
 
@@ -737,15 +889,21 @@ class LTXVAVLoopingSampler:
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
                 audio_cond_strength=audio_cond_strength,
                 adain_factor=adain_factor,
+                phase2_sampler=phase2_sampler,
+                phase2_guider=phase2_guider,
+                phase2_start_step=phase2_start_step,
             )
 
             # Build AdaIN reference for this chunk
             if adain_factor > 0.0:
                 if normalizing_latents is not None:
-                    # Per-frame reference: slice normalizing latents to chunk window
+                    # Per-frame reference: slice normalizing latents to the chunk's
+                    # full window (including the overlap context on extend chunks,
+                    # since the chunk output covers it too).
                     nl = normalizing_latents["samples"]
-                    nl_start = min(v_start, nl.shape[2] - 1)
-                    nl_end   = min(v_end,   nl.shape[2])
+                    win_start = v_start - temporal_overlap if v_start > 0 else 0
+                    nl_start = min(max(0, win_start), nl.shape[2] - 1)
+                    nl_end   = min(v_end,             nl.shape[2])
                     chunk_adain_ref = nl[:, :, nl_start:nl_end]
                 else:
                     # Fall back to first chunk output (per-channel global)
@@ -756,7 +914,7 @@ class LTXVAVLoopingSampler:
             if v_start == 0:
                 video_acc, audio_acc = self._sample_first_chunk(
                     **shared,
-                    temporal_tile_size=temporal_tile_size,
+                    temporal_tile_size=n_new,
                     cond_images=cond_images, cond_image_strength=cond_image_strength,
                     adain_ref=chunk_adain_ref, adain_per_frame=adain_per_frame,
                 )
@@ -768,7 +926,7 @@ class LTXVAVLoopingSampler:
                     **shared,
                     video_acc=video_acc, audio_acc=audio_acc,
                     v_start=v_start, v_end=v_end,
-                    temporal_tile_size=temporal_tile_size,
+                    temporal_tile_size=n_new,
                     temporal_overlap=temporal_overlap,
                     overlap_cond_strength=overlap_cond_strength,
                     audio_overlap_cond_strength=audio_overlap_cond_strength,
@@ -801,7 +959,11 @@ class LTXVAVLoopingSampler:
         optional_normalizing_latents=None,
         guiding_start_step=0, guiding_end_step=1000,
         optional_cond_image_indices="0",
-        per_tile_seed_offsets="0",          # hidden
+        scene_lengths="",
+        per_tile_seed_offsets="0",
+        optional_phase2_sampler=None,
+        optional_phase2_guider=None,
+        phase2_start_step=0,
     ):
         samples = latents["samples"]
         if not isinstance(samples, NestedTensor):
@@ -820,6 +982,38 @@ class LTXVAVLoopingSampler:
         overlap_v   = temporal_overlap   // time_scale
         first_seed  = noise.seed
 
+        # Chunk schedule: new-content latents per chunk, walked exactly by the
+        # temporal loop (scheduler and accumulator share one coordinate system —
+        # no ghost chunks, no end-of-video sliver restarts). Uniform tile_size_v
+        # per chunk unless scene_lengths provides per-chunk pixel-frame counts.
+        scene_sizes = None
+        if scene_lengths and scene_lengths.strip():
+            scene_sizes = [
+                max(1, int(round(float(x))) // time_scale)
+                for x in scene_lengths.replace(",", "|").split("|")
+                if x.strip()
+            ]
+        chunk_schedule = []
+        pos = 0
+        while pos < frames:
+            if scene_sizes:
+                n = scene_sizes[min(len(chunk_schedule), len(scene_sizes) - 1)]
+            else:
+                n = tile_size_v
+            n = min(n, frames - pos)
+            chunk_schedule.append(n)
+            pos += n
+        if scene_sizes and len(scene_sizes) != len(chunk_schedule):
+            print(
+                f"[LTXVAVLoopingSampler] scene_lengths has {len(scene_sizes)} entries "
+                f"but the timeline needs {len(chunk_schedule)} chunks — "
+                f"{'last entry repeated' if len(scene_sizes) < len(chunk_schedule) else 'extra entries unused'}."
+            )
+        print(
+            f"[LTXVAVLoopingSampler] schedule: {len(chunk_schedule)} chunks, "
+            f"new latents per chunk {chunk_schedule}"
+        )
+
         per_tile_seed_offsets_list = self._parse_ints(per_tile_seed_offsets, "0")
 
         kf_indices = self._parse_ints(
@@ -827,7 +1021,7 @@ class LTXVAVLoopingSampler:
             total_size=frames * time_scale - 7,
         )
         kf_per_tile = self._calculate_keyframe_per_tile_indices(
-            kf_indices, temporal_tile_size, temporal_overlap, frames * time_scale - 7
+            kf_indices, chunk_schedule, overlap_v, time_scale
         )
 
         if optional_cond_images is not None:
@@ -902,7 +1096,7 @@ class LTXVAVLoopingSampler:
                     audio_full=audio_samples, ltxav=ltxav,
                     time_scale=time_scale, width_scale=width_scale, height_scale=height_scale,
                     tile_h=th, tile_w=tw,
-                    temporal_tile_size=tile_size_v,
+                    chunk_schedule=chunk_schedule,
                     temporal_overlap=overlap_v,
                     fps=video_fps,
                     overlap_cond_strength=temporal_overlap_cond_strength,
@@ -926,6 +1120,9 @@ class LTXVAVLoopingSampler:
                     per_tile_seed_offsets=per_tile_seed_offsets_list,
                     adain_factor=adain_factor,
                     normalizing_latents=tile_norm,
+                    phase2_sampler=optional_phase2_sampler,
+                    phase2_guider=optional_phase2_guider,
+                    phase2_start_step=phase2_start_step,
                 )
 
                 # accumulate video with spatial weights
