@@ -230,6 +230,22 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `optional_phase2_sampler` | — | Second-phase sampler for dual-sampler schedules. Takes over at `phase2_start_step` within every chunk, resample-style continuation (Clownshark-chain pattern). |
 | `optional_phase2_guider` | — | Guider for phase 2 (e.g. CFG 1.0 vs. phase 1's 2.0). Its conditioning is replaced by the chunk's; only guidance settings apply. Falls back to the main guider. |
 | `phase2_start_step` | 0 | Schedule step where phase 2 takes over. 0 = disabled. |
+| `optional_prior_av_latent` | — | Existing AV latent to **continue from**, treated as a prior chunk. The accumulator is seeded with it and generation continues after it via the overlap mechanism — no masks, no re-sampling of the prior. `latents` then defines only the **new** region to generate. Output is prior + continuation. |
+
+### Continuing an existing video
+
+Wire an encoded AV latent into `optional_prior_av_latent` and the looping sampler treats it as an already-generated prior chunk: it seeds the accumulator with it and generates a continuation using the same trained overlap continuity it uses between its own chunks. The prior is preserved (it is the accumulator's seed, never re-sampled) except its last `temporal_overlap` frames, which blend into the first new chunk for a seamless handoff.
+
+```
+existing video → VAE encode (video) ─┐
+existing audio → VAE encode (audio) ─┴─ LTXVConcatAVLatent → optional_prior_av_latent
+empty AV latent (new duration; scene_lengths for the continuation) → latents
+```
+
+- `latents` sizes and scripts only the **new** region (its length is the continuation length; `scene_lengths` and per-chunk prompts apply to the new content).
+- The output is the full `prior + continuation` as one AV latent. No masks are involved on input or output.
+- Works with `audio_cond_strength` for the new region (free-gen or condition on a new track); the prior's own audio carries forward via the audio bridge.
+- Not yet combined with mid-video keyframes or IC-LoRA guiding latents in the same pass (their indices assume a from-zero timeline).
 | `guiding_start_step` | 0 | Sigma schedule step at which guiding latents begin influencing. |
 | `guiding_end_step` | 1000 | Sigma schedule step at which guiding latents stop influencing. |
 

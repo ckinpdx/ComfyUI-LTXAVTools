@@ -244,6 +244,13 @@ class LTXVAVLoopingSampler:
                                "E.g. 4 on a 12-step schedule: steps 0-3 use the main "
                                "sampler/guider, steps 4+ use the phase-2 pair.",
                 }),
+                "optional_prior_av_latent": ("LATENT", {
+                    "tooltip": "Existing AV latent to continue from, treated as a prior "
+                               "chunk. The accumulator is seeded with it and generation "
+                               "continues after it via the overlap mechanism (no masks, "
+                               "no re-sampling of the prior). `latents` then defines only "
+                               "the NEW region to generate. Output is prior + continuation.",
+                }),
             },
         }
 
@@ -834,10 +841,9 @@ class LTXVAVLoopingSampler:
         audio_cond_strength=0.0,
         adain_factor=0.0, normalizing_latents=None,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
+        prior_v_frames=0, prior_a_frames=0,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
-        video_acc    = None
-        audio_acc    = None
         chunk_idx    = 0
         adain_ref    = None   # set after first chunk; used as fallback when no normalizing_latents
         adain_per_frame = normalizing_latents is not None
@@ -846,7 +852,20 @@ class LTXVAVLoopingSampler:
         # (v_start == n_acc for every extend chunk), so guide slices, normalizing
         # slices, and keyframe routing all index the same timeline, and the loop
         # terminates exactly when the video is covered.
-        cum = 0
+        #
+        # Prior continuation: seed the accumulator with the prior region (the first
+        # prior_v_frames video / prior_a_frames audio latents of the working input)
+        # and start the loop at its end. The first generated chunk is then an extend
+        # chunk continuing from the prior's tail — no chunk-0 generation, and the
+        # prior is preserved as the accumulator seed.
+        if prior_v_frames > 0:
+            video_acc = {"samples": video_tile_latent["samples"][:, :, :prior_v_frames].clone()}
+            audio_acc = audio_full[:, :, :prior_a_frames].clone()
+            cum       = prior_v_frames
+        else:
+            video_acc = None
+            audio_acc = None
+            cum       = 0
         for i_t, n_new in enumerate(chunk_schedule):
             v_start = cum
             v_end   = min(v_start + n_new, T_v)
@@ -964,6 +983,7 @@ class LTXVAVLoopingSampler:
         optional_phase2_sampler=None,
         optional_phase2_guider=None,
         phase2_start_step=0,
+        optional_prior_av_latent=None,
     ):
         samples = latents["samples"]
         if not isinstance(samples, NestedTensor):
@@ -975,7 +995,32 @@ class LTXVAVLoopingSampler:
         ltxav = self._get_ltxav_model(model)
         video_samples, audio_samples = self._split_av(samples, ltxav)
 
+        # Prior AV latent (video continuation): prepend the existing content to the
+        # working latent and seed the accumulator with it, so generation continues
+        # after it via the standard overlap mechanism. `latents` defines only the
+        # NEW region; the output is prior + continuation. The prior is preserved
+        # (accumulator seed, never re-sampled) except its overlap tail, which blends
+        # into the continuation for a seamless handoff.
+        prior_v_frames = 0
+        prior_a_frames = 0
+        if optional_prior_av_latent is not None:
+            prior_samples = optional_prior_av_latent["samples"]
+            if not isinstance(prior_samples, NestedTensor):
+                raise ValueError(
+                    "[LTXVAVLoopingSampler] optional_prior_av_latent must be an AV "
+                    "NestedTensor (same format as the main latent input)."
+                )
+            prior_v, prior_a = self._split_av(prior_samples, ltxav)
+            prior_v_frames = prior_v.shape[2]
+            prior_a_frames = prior_a.shape[2]
+            video_samples = torch.cat([prior_v.to(video_samples), video_samples], dim=2)
+            audio_samples = torch.cat([prior_a.to(audio_samples), audio_samples], dim=2)
+            print(f"[LTXVAVLoopingSampler] prior AV latent seeded: "
+                  f"{prior_v_frames} video / {prior_a_frames} audio latents; "
+                  f"continuing after it.")
+
         B, C, frames, height, width = video_samples.shape
+        new_frames = frames - prior_v_frames  # region to generate, after the prior
         time_scale, width_scale, height_scale = vae.downscale_index_formula
 
         tile_size_v = temporal_tile_size // time_scale
@@ -995,12 +1040,12 @@ class LTXVAVLoopingSampler:
             ]
         chunk_schedule = []
         pos = 0
-        while pos < frames:
+        while pos < new_frames:
             if scene_sizes:
                 n = scene_sizes[min(len(chunk_schedule), len(scene_sizes) - 1)]
             else:
                 n = tile_size_v
-            n = min(n, frames - pos)
+            n = min(n, new_frames - pos)
             chunk_schedule.append(n)
             pos += n
         if scene_sizes and len(scene_sizes) != len(chunk_schedule):
@@ -1123,6 +1168,8 @@ class LTXVAVLoopingSampler:
                     phase2_sampler=optional_phase2_sampler,
                     phase2_guider=optional_phase2_guider,
                     phase2_start_step=phase2_start_step,
+                    prior_v_frames=prior_v_frames,
+                    prior_a_frames=prior_a_frames,
                 )
 
                 # accumulate video with spatial weights
