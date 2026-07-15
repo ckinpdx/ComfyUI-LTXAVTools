@@ -19,6 +19,14 @@ SHORT_MIN      = 512
 
 _STAGE_GRID = {1: 32, 2: 64, 3: 128}
 
+
+def _snap(x, grid: int) -> int:
+    """Snap x to the nearest positive multiple of grid (LTX-valid resolution).
+    Returns 0 for non-positive/None input (used as the bypass sentinel)."""
+    if not x or x <= 0:
+        return 0
+    return max(grid, int(round(x / grid)) * grid)
+
 # ---------------------------------------------------------------------------
 # Ratio definitions
 # ---------------------------------------------------------------------------
@@ -118,18 +126,57 @@ class LTXDimensionCalculator:
                     "default": _DEFAULT_OPTS[mid],
                     "tooltip": "All options are divisible by 64 (LTX-compatible).",
                 }),
-            }
+            },
+            "optional": {
+                "use_custom": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Override the dropdown with custom_width/custom_height. "
+                               "Toggle-controlled (not value-based), so a bypassed upstream "
+                               "node can't accidentally switch modes.",
+                }),
+                "custom_role": (["half (stage 1)", "full (final)"], {
+                    "default": "half (stage 1)",
+                    "tooltip": "Is the custom size your stage-1 (half) resolution or the "
+                               "final (full) resolution? 'half (stage 1)' sets full = 2x "
+                               "custom (input-video case: stage 1 matches the source, "
+                               "stage 2 doubles). 'full (final)' sets half = custom / 2.",
+                }),
+                "custom_width": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Custom width — used only when use_custom is on. Snapped to "
+                               "the valid grid (÷32 in half role, ÷64 in full role).",
+                }),
+                "custom_height": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Custom height — used only when use_custom is on.",
+                }),
+            },
         }
 
     @classmethod
-    def VALIDATE_INPUTS(cls, ratio, orientation, resolution):
+    def VALIDATE_INPUTS(cls, **kwargs):
         return True
 
     RETURN_TYPES  = ("INT", "INT", "INT", "INT", "STRING")
     RETURN_NAMES  = ("width", "height", "width_half", "height_half", "label")
     FUNCTION      = "calculate"
 
-    def calculate(self, ratio: str, orientation: str, resolution: str):
+    def calculate(self, ratio: str, orientation: str, resolution: str,
+                  use_custom: bool = False, custom_role: str = "half (stage 1)",
+                  custom_width: int = 0, custom_height: int = 0):
+        if use_custom:
+            cw = _snap(custom_width, 32 if str(custom_role).startswith("half") else 64)
+            ch = _snap(custom_height, 32 if str(custom_role).startswith("half") else 64)
+            if cw > 0 and ch > 0:
+                if str(custom_role).startswith("half"):
+                    # custom = stage-1 (half) res; full = 2x → stage 2 doubles
+                    fw, fh = cw * 2, ch * 2
+                    return (fw, fh, cw, ch, f"{cw}x{ch} (stage1) -> {fw}x{fh} (final)")
+                # custom = full (final) res; half = /2 (÷64 keeps it ÷32)
+                hw, hh = cw // 2, ch // 2
+                return (cw, ch, hw, hh, f"{cw}x{ch} (final) -> {hw}x{hh} (stage1)")
+            print("[LTXDimensionCalculator] use_custom on but custom dims <= 0 "
+                  "(upstream bypassed?); falling back to the dropdown.")
         w, h = map(int, resolution.split("x"))
         return (w, h, w // 2, h // 2, resolution)
 

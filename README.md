@@ -11,6 +11,12 @@ Aspect-ratio-aware resolution picker. Outputs only LTX-compatible resolutions (d
 
 **Outputs:** `width`, `height`, `width_half`, `height_half`, `label`
 
+**Custom override** (optional): toggle `use_custom` to override the dropdown with `custom_width`/`custom_height` — for input videos at resolutions the dropdown doesn't list. The toggle (not a value check) controls the mode, so bypassing an upstream node feeding the custom dims won't accidentally switch it (and if `use_custom` is on but the dims arrive ≤ 0, it warns and falls back to the dropdown).
+
+`custom_role` sets how the custom size maps to the two stages:
+- **`half (stage 1)`** — the custom size is your stage-1 resolution; the node snaps it to ÷32 and sets `width`/`height` = **2× custom**. Use this for continuing/encoding an input video: stage 1 runs at the source resolution and stage 2 doubles. (e.g. custom 960×512 → half 960×512, full 1920×1024.)
+- **`full (final)`** — the custom size is the final resolution; snapped to ÷64 so the derived half stays ÷32. (custom 960×512 → full 960×512, half 480×256.)
+
 ### LTX Dimension Calculator 3 Stage
 Same as above but constrained to div-by-128 resolutions, compatible with 3-stage pipelines (full / half / quarter resolutions all remain div-by-32).
 
