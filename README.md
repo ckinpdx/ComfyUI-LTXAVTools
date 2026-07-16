@@ -134,6 +134,18 @@ Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four 
 
 ---
 
+### LTX AV Cross-Attention Toggle
+Switches the LTX2.3 AV model's cross-modal attention couplings on/off via `transformer_options` (read at `av_model.py` `run_a2v` / `run_v2a`). Takes a `MODEL`, returns a patched clone (source untouched). Both default **on**, so it is a no-op until you flip one. Works with any sampler — wire it on the model line before the sampler.
+
+| Input | Default | Description |
+|---|---|---|
+| `v2a_cross_attn` | True | Video→audio coupling. Turn **off** when *generating* new-word audio over a guide video whose lips articulate different words — otherwise the guide's visible lips out-muscle the text (lips↔audio is near-deterministic in training, text→audio is one-to-many) and corrupt generated speech into gibberish. Off = audio driven purely by the text prompt; a2v still syncs the video mouth to the new audio. No effect when audio is supplied as input (frozen) — v2a only bites during audio *generation*. |
+| `a2v_cross_attn` | True | Audio→video coupling — this **is** lipsync (the mouth following the audio). Turn off only to fully decouple video from audio; disabling it kills lipsync. Rarely wanted. |
+
+**Use case — changing the words over a guide video:** the guide's lips say the original words; asking the audio branch to generate *different* words while those lips are visible produces gibberish. Set `v2a_cross_attn = False` and the text drives the audio cleanly while a2v resyncs the (LoRA-freed) mouth to the new speech.
+
+---
+
 ### LTX Distilled Sigmas
 Generates a sigma schedule for **distilled or heavily distill-LoRA weighted LTX models** using a high-cluster + cliff + power-tail structure. Not suitable for full dev model runs. Concentrates steps near sigma=1.0, then uses a single large cliff step exploiting the distilled model's learned shortcut, followed by a power-curve tail to zero.
 
@@ -260,9 +272,13 @@ empty AV latent (new duration; scene_lengths for the continuation) → latents
 Audio continuity across chunk boundaries is maintained through two complementary mechanisms:
 
 1. **Noise mask carry-over** — the last N audio frames from the accumulated output are carried into each chunk's init latent with a strong conditioning mask (`audio_overlap_cond_strength`).
-2. **Bridge stitching** — when stitching, the accumulated audio tail is replaced by the model's own regenerated carry-over rather than hard-concatenated, avoiding spectral discontinuities at boundaries. The carry length `(overlap − 1) × 8 + 1` absorbs the first-frame asymmetry, so chunk audio is stitched without trimming or padding.
+2. **Seam stitching** — how the accumulated tail joins the new frames depends on `audio_overlap_cond_strength`:
+   - **≥ 1.0 (default): keep-carry-verbatim.** The accumulator's real audio tail is preserved and only the genuinely-new frames are appended. The carry was frozen (mask 0), so it must **not** be re-voiced under the incoming chunk's conditioning — regenerating it there causes the seam to "speak" the new chunk's text, static-image burn-in, and continuation gibberish. Keeping it verbatim eliminates all three.
+   - **< 1.0: regenerated bridge.** The carry was allowed to drift, so the model's own regenerated carry-over replaces the accumulated tail (hard-joining the real tail would create a discontinuity).
 
-For voice identity continuity across separate generations, use `LTX Add Audio Latent Guide` to inject reference audio at the conditioning level.
+   Both paths yield identical length; the carry length `(overlap − 1) × 8 + 1` absorbs the first-frame asymmetry, so chunk audio is stitched without trimming or padding.
+
+For voice identity continuity across separate generations, use `LTX Add Audio Latent Guide` to inject reference audio at the conditioning level. A stronger, per-chunk-switchable approach is specced in [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md) (not yet built).
 
 ### Audio alignment notes
 
