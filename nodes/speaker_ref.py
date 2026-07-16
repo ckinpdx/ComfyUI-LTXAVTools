@@ -1,4 +1,34 @@
 """
+==============================================================================
+ABANDONED (2026-07-15): multi-reference / multi-speaker ID-LoRA is NOT thought
+to be possible with this architecture. The code below is kept as a record and
+a starting point, not removed — but do not expect it to produce clean
+multi-voice output.
+
+WHY IT CANNOT WORK — the ID-LoRA is inherently SINGLE-VOICE:
+  * Its ref_audio tokens are attended GLOBALLY by every audio frame (voice
+    identity emerges from whole-clip self-attention), and the identity-guidance
+    pass amplifies that reference GLOBALLY. There is no mechanism to say "this
+    voice for these frames, that voice for those."
+  * It was TRAINED to transfer ONE voice to the ENTIRE clip. Any voice
+    diversity in a scene is out of distribution for it.
+
+Per-chunk reference switching (this module's whole approach) therefore cannot
+fix it: at every turn boundary the incoming speaker's global reference fights
+the frozen audio carry belonging to the previous speaker, because the
+conditioning is not temporally localizable. Empirically, multi-speaker runs
+degrade (garbled onsets, wrong-speaker bleed), and the per-chunk-ref plus
+turn-silence workarounds never fully held — they patch a mechanism that
+fundamentally can't localize a single global voice.
+
+Real multi-voice requires a DIFFERENT mechanism, not a knob on this one:
+trained per-speaker binding (MultiTalk-style L-RoPE labels, or a
+Bind-Your-Avatar-style embedding router), or a model-level audio-attention mask
+restricting which frames attend to which ref tokens. None of that is reachable
+by driving the single-speaker ID-LoRA from the sampler. See
+memory/ltxav-looping-sampler.md for the full reasoning.
+==============================================================================
+
 Multi-speaker voice identity for LTX2.3 AV ID-LoRA generation.
 
 LTXAVReferenceAudioMulti — drop-in replacement for the core LTXVReferenceAudio
