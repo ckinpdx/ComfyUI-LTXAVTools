@@ -806,14 +806,31 @@ class LTXVAVLoopingSampler:
         # audible stutter at every join and -40ms/chunk cumulative AV drift.
         audio_body = audio_out  # T_a_chunk frames
 
-        # Use model's regenerated carry-over as the bridge rather than hard-joining
-        # audio_acc's tail to the new frames. The model generated audio_body as one
-        # coherent sequence (carry-over + new), so replacing acc's tail with it
-        # avoids a latent-space discontinuity. With high audio_overlap_cond_strength
-        # the regenerated carry-over is nearly identical to the original.
-        # Result length = (acc - a_overlap) + T_a_chunk = acc + num_new_v*8 exactly.
-        audio_head   = audio_acc[:, :, :-a_overlap, :]
-        audio_result = torch.cat([audio_head, audio_body], dim=2)
+        # Bridge selection depends on how frozen the carry-over is.
+        #
+        # At audio_overlap_cond_strength >= 1.0 the carry region was conditioned
+        # to reproduce audio_acc's tail verbatim (mask ~0 there), so KEEP the real
+        # accumulator tail and append only the genuinely-new frames. This stops the
+        # seam from ever re-voicing the carry under THIS chunk's text conditioning
+        # — the failure mode where a boundary "speaks the prompt" because the
+        # regenerated carry inherits the new chunk's speech/description text. It is
+        # the same regeneration-at-the-seam artifact behind static-image burn-in and
+        # cross-chunk gibberish; freezing the carry kills all three.
+        #
+        # Below 1.0 the carry was allowed to drift, so audio_body's new frames
+        # continue from a drifted carry rather than acc's tail; hard-joining acc's
+        # real tail would create a discontinuity. There, keep the original
+        # behaviour: use the model's regenerated carry-over (carry + new) as one
+        # coherent bridge, replacing acc's tail.
+        #
+        # Both paths yield the same length:
+        #   verbatim: acc + (T_a_chunk - a_overlap) = acc + T_a_new
+        #   regen:    (acc - a_overlap) + T_a_chunk = acc + T_a_new
+        if audio_overlap_cond_strength >= 1.0:
+            audio_result = torch.cat([audio_acc, audio_body[:, :, a_overlap:, :]], dim=2)
+        else:
+            audio_head   = audio_acc[:, :, :-a_overlap, :]
+            audio_result = torch.cat([audio_head, audio_body], dim=2)
 
         return {"samples": video_result}, audio_result
 
