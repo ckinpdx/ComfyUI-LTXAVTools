@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-ltxavtools"
+version = "1.0.0"
+description = "Utility nodes for LTX-2.3 audio-video generation and LoRA training workflows in ComfyUI."
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torchaudio"]
+
+[project.urls]
+Repository = "https://github.com/ckinpdx/ComfyUI-LTXAVTools"
+
+[tool.comfy]
+PublisherId = "ckinpdx"
+DisplayName = "ComfyUI-LTXAVTools"
