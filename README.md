@@ -116,18 +116,24 @@ Removes `ref_audio` from conditioning after sampling. Pair with LTX Add Audio La
 **Inputs:** `positive`, `negative` — **Outputs:** `positive`, `negative`
 
 ### LTX AV Reference Audio Multi (ID-LoRA)
-Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four reference voices (~5 s clean clips). Speaker 1 is applied as the default `ref_audio` and the identity-guidance model patch is identical to the core node — with a single reference this is a drop-in replacement. All encoded voices are attached to the positive conditioning as a `ref_audio_bank`, which the AV Looping Sampler reads to switch voices per chunk.
+
+> **⚠️ ABANDONED (2026-07-15) — multi-voice does not work.** The ID-LoRA's `ref_audio` is attended *globally* by every audio frame and the identity-guidance pass amplifies it *globally*, so it is **inherently single-voice**; per-chunk reference switching cannot localize a single global voice, and multi-speaker runs degrade (garbled onsets, wrong-speaker bleed). The node is kept as a record and remains a valid **single-reference** drop-in for the core `LTXVReferenceAudio` (speaker 1 only). For real multi-voice, see [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md) (negative-index reference audio — specced, not built) and the ABANDONED header in `nodes/speaker_ref.py` for the full reasoning.
+
+Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four reference voices (~5 s clean clips). Speaker 1 is applied as the default `ref_audio` and the identity-guidance model patch is identical to the core node — with a single reference this is a drop-in replacement. All encoded voices are attached to the positive conditioning as a `ref_audio_bank` (the multi-voice path the sampler *would* read — non-functional per above).
 
 | Input | Description |
 |---|---|
 | `model`, `positive`, `negative` | passed through (model cloned + patched) |
 | `audio_vae` | LTXV audio VAE |
 | `reference_audio_1` | Speaker 1 — default voice (required) |
-| `reference_audio_2..4` | Additional speakers (optional) |
+| `reference_audio_2..4` | Additional speakers (optional — non-functional, see above) |
 | `identity_guidance_scale` | Extra no-reference pass per step amplifies speaker identity; 0 disables |
 | `start_percent` / `end_percent` | Sigma range where identity guidance is active |
 
 ### LTX AV Speaker Prompt Provider
+
+> **⚠️ ABANDONED (2026-07-15)** — the per-chunk `[SPEAKER n]` routing half of the abandoned multi-voice ID-LoRA approach above. Kept as a record; not a working multi-voice path.
+
 `MultiPromptProvider` with voice routing for multi-speaker ID-LoRA generation. Splits prompts on `|` (one per temporal chunk). Segments using `[SPEAKER n]:` in place of `[SPEECH]:` select voice *n* from the reference bank for that chunk; the tag is rewritten to `[SPEECH]:` **before** encoding, so the model only ever sees its trained format. Untagged segments use the default voice. One speaker per chunk — turn-based dialog only.
 
 **Inputs:** `prompts`, `clip` — **Output:** `conditionings` (wire to `optional_positive_conditionings`)
