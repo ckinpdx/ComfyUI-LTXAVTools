@@ -4,10 +4,20 @@ import node_helpers
 
 class LTXVAddAudioLatentGuide:
     """
-    Adds an audio latent as a reference guide for LTX2 AV generation.
-    Injects the audio as ref_audio tokens into the conditioning, placed
-    before t=0 of the generation window. The model attends to these tokens
-    to influence audio character/identity in the generated segment.
+    ARTIFACT (2026-07-15): retested by the user — NO EFFECT without the
+    ID-LoRA. Kept as a record, not removed. Do not build on it.
+
+    Why it is dead: it sets ref_audio tokens on the conditioning, which the
+    AV model prepends at NEGATIVE temporal coords with timestep 0
+    (av_model.py _process_input) — but that placement is an ID-LoRA
+    training convention. The base model was never trained to read
+    negative-position audio tokens and is deaf to them. The pathway only
+    functions WITH the TalkVid ID-LoRA (which is inherently single-voice;
+    use the core LTXVReferenceAudio node for that).
+
+    The working base-model alternative is CARRY-SWAP — injecting the ref
+    voice into the extend chunk's audio carry slot (on-timeline, mask-
+    frozen, the proven voice-transfer pathway). See SPEC_NEG_REF_AUDIO.md.
 
     Input must be a raw audio latent [B, C, T, F], not a NestedTensor.
     Use LTXVSeparateAVLatent first if you have a combined AV latent.
@@ -28,8 +38,9 @@ class LTXVAddAudioLatentGuide:
     FUNCTION = "generate"
     CATEGORY = "LTXAVTools/audio"
     DESCRIPTION = (
-        "Injects an audio latent as reference conditioning for LTX2 AV generation. "
-        "The audio is placed before t=0 of the generation window to influence audio character. "
+        "Injects an audio latent as ref_audio conditioning tokens. The AV model "
+        "prepends them in-band at negative temporal positions (before t=0, timestep 0, "
+        "trimmed from output) — a negative-index audio reference, no model patch. "
         "Input must be a raw audio latent [B, C, T, F] — use LTXVSeparateAVLatent first "
         "if you have a combined AV latent."
     )
