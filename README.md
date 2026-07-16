@@ -98,9 +98,10 @@ Pads a 4D audio latent `[B, C, T, F]` by repeating its last frame N times (defau
 ---
 
 ### LTX Add Audio Latent Guide
-Injects a raw audio latent as reference conditioning for LTX2.3 AV generation. The audio is placed at negative temporal RoPE positions (before t=0) so it influences audio character without contaminating the generated latent sequence.
 
-Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` first if you have a combined AV latent.
+> **⚠️ ARTIFACT (2026-07-15) — retested, no effect without the ID-LoRA. Kept as a record; do not build on it.** It sets `ref_audio` tokens, which the AV model prepends at negative temporal coords with timestep 0 (`av_model.py` `_process_input`) — but that placement is an ID-LoRA training convention, and the base model is deaf to it. The pathway only functions with the TalkVid ID-LoRA (use the core `LTXVReferenceAudio` node for that). The working base-model voice-reference mechanism is **carry-swap** — see [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md).
+
+Injects a raw audio latent as `ref_audio` conditioning tokens. Input must be a raw 4D audio latent `[B, C, T, F]`. Use `LTXVSeparateAVLatent` first if you have a combined AV latent.
 
 | Input | Description |
 |---|---|
@@ -284,7 +285,7 @@ Audio continuity across chunk boundaries is maintained through two complementary
 
    Both paths yield identical length; the carry length `(overlap − 1) × 8 + 1` absorbs the first-frame asymmetry, so chunk audio is stitched without trimming or padding.
 
-For voice identity continuity across separate generations, use `LTX Add Audio Latent Guide` to inject reference audio at the conditioning level. A stronger, per-chunk-switchable approach is specced in [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md) (not yet built).
+For voice identity across chunks/turns, the designed mechanism is **carry-swap** — replacing an extend chunk's audio carry with a reference-voice latent (on-timeline, mask-frozen, discarded from output by the keep-verbatim stitch): see [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md) (confirmed design, not yet built). The `ref_audio` conditioning pathway (`LTX Add Audio Latent Guide`, core `LTXVReferenceAudio`) only functions with the TalkVid ID-LoRA loaded.
 
 ### Audio alignment notes
 
