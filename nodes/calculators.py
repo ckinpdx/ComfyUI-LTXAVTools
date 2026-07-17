@@ -299,7 +299,7 @@ class LTXSceneLengthCalculator:
         return {
             "required": {
                 "scene_seconds": ("STRING", {
-                    "multiline": True,
+                    "multiline": False,
                     "default": "10 | 10 | 10",
                     "tooltip": "Scene durations in seconds, separated by '|' or ','. "
                                "One scene per chunk / prompt segment.",
@@ -333,11 +333,100 @@ class LTXSceneLengthCalculator:
         return (scene_lengths, frame_count, len(px_list), info, actual_seconds)
 
 
+class LTXKeyframePlanner:
+    """
+    Plans end-anchored keyframe indices from a scene_lengths schedule.
+
+    Travel semantics: the first keyframe (optional) opens the video at frame 0;
+    every subsequent keyframe sits at the END of its scene, so each chunk
+    generates TOWARD its destination image and the next scene continues from
+    the arrived state via the ordinary overlap carry (no conditioning needed at
+    scene starts — start-anchoring instead would put the image in the NEXT
+    chunk and invite a snap at every seam). The final scene's end is the
+    video's end, emitted as -1 (the sampler's from-the-end convention).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "scene_lengths": ("STRING", {
+                    "default": "",
+                    "tooltip": "Pipe/comma-separated pixel-frame counts per scene "
+                               "(multiples of 8) — from the LTX Scene Length "
+                               "Calculator, the LTX Video Cut Marker, or by hand.",
+                }),
+                "include_start": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Keyframe at frame 0 — the opening image (I2V-style).",
+                }),
+                "include_end": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Keyframe at -1 — the closing image (end of the "
+                               "final scene).",
+                }),
+                "fps": ("FLOAT", {
+                    "default": 25.0, "min": 1.0, "max": 120.0, "step": 0.01,
+                    "tooltip": "For the info receipt's timestamps only.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "STRING")
+    RETURN_NAMES = ("indices", "count", "info")
+    FUNCTION     = "plan"
+    CATEGORY     = "LTXAVTools/calculators"
+    DESCRIPTION  = (
+        "End-anchored keyframe planner: frame 0 opens, each scene travels to a "
+        "keyframe at its end, the final scene ends on -1. Wire `indices` to the "
+        "AV Looping Sampler's optional_cond_image_indices; `count` is how many "
+        "images optional_cond_images must contain, in order."
+    )
+
+    def plan(self, scene_lengths, include_start, include_end, fps):
+        parts = [p.strip() for p in scene_lengths.replace(",", "|").split("|") if p.strip()]
+        if not parts:
+            return ("", 0, "no scenes — empty scene_lengths")
+
+        latents = []
+        for p in parts:
+            try:
+                px = int(round(float(p)))
+            except ValueError:
+                raise ValueError(f"[LTXKeyframePlanner] non-numeric scene entry '{p}'")
+            latents.append(max(1, int(round(px / 8.0))))
+
+        total_latents = sum(latents)
+        frame_count   = (total_latents - 1) * 8 + 1
+
+        entries = []   # (index, label_time)
+        if include_start:
+            entries.append((0, 0.0))
+        cum = 0
+        for n in latents[:-1]:              # ends of scenes 1..N-1
+            cum += n
+            end_px = 8 * (cum - 1)          # last pixel frame of the scene
+            entries.append((end_px, end_px / fps))
+        if include_end:                     # final scene's end = video end
+            entries.append((-1, (frame_count - 1) / fps))
+
+        indices = ",".join(str(i) for i, _ in entries)
+        info = " · ".join(
+            f"img{k} @ {i} ({t:.2f}s{', end' if i == -1 else ''})"
+            for k, (i, t) in enumerate(entries)
+        )
+        info = f"{len(entries)} keyframes for {len(latents)} scenes: {info}"
+        print(f"[LTXKeyframePlanner] {info}")
+
+        return (indices, len(entries), info)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXDimensionCalculator":       LTXDimensionCalculator,
     "LTXDimensionCalculator3Stage": LTXDimensionCalculator3Stage,
     "LTXFrameCalculator":           LTXFrameCalculator,
     "LTXSceneLengthCalculator":     LTXSceneLengthCalculator,
+    "LTXKeyframePlanner":           LTXKeyframePlanner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -345,4 +434,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXDimensionCalculator3Stage": "LTX Dimension Calculator 3 Stage",
     "LTXFrameCalculator":           "LTX Frame Calculator",
     "LTXSceneLengthCalculator":     "LTX Scene Length Calculator",
+    "LTXKeyframePlanner":           "LTX Keyframe Planner",
 }
