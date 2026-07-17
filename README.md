@@ -47,6 +47,36 @@ Authors variable scene lengths for the AV Looping Sampler. Takes scene durations
 
 `actual_seconds` (= `frame_count / fps`) matches the LTX Frame Calculator convention — use it to trim input audio to the exact video duration in conditioned-audio workflows.
 
+### LTX Video Cut Marker (Scenes)
+Interactive timeline widget for authoring a scene schedule against real media. Load a **video or audio file** (picker, upload button, or drag-and-drop) — audio files show a **waveform** on the timeline (videos show their soundtrack's waveform too), so scenes can be cut against a song's sections visually. Cuts mark scene boundaries, hard-snapped to the LTX latent grid; an optional **end marker** (red, `E`) truncates the schedule and everything downstream.
+
+Indices are **time-anchored and emitted in `emit_fps` frame space** (default 25): a 24fps source marked while emitting at 25 — the VHS `force_rate` case — produces a schedule in the *pipeline's* frame space, not the file's.
+
+Controls: double-click / `C` = add cut · drag = move (snapped) · click = select · ←/→ = nudge one latent · right-click / `X` / Del = delete · `E` = end marker · Space = play · Alt+←/→ = fine playhead step.
+
+| Output | Description |
+|---|---|
+| `scene_lengths` | Pipe-separated px counts incl. the final scene → sampler `scene_lengths` |
+| `frame_count` | `sum − 7` — the matching empty-latent length |
+| `video_path` | → VHS Load Video (Path); this node does not decode |
+| `frame_load_cap` | = `frame_count` — cap the upstream loader to exactly the scheduled frames |
+
+### LTX Keyframe Planner
+Turns a `scene_lengths` schedule into **end-anchored keyframe indices** for keyframe-travel generation: frame `0` opens (optional), each scene travels to a keyframe at **its own end** — landing in its own chunk so generation converges on the image and the next scene inherits through the overlap carry — and the final scene closes on `-1` (optional). `128|128|96` → `0,120,248,-1`.
+
+**Outputs:** `indices` (→ `optional_cond_image_indices`), `count` (must equal the images stacked into `optional_cond_images`, in order), `info` (per-image timestamps receipt).
+
+### LTX Keyframe Pair Concat
+Emits consecutive keyframe pairs as one composite image for **vision-LLM scene prompting**: index 1 → images 1+2, index 2 → 2+3… Under the end-anchored plan, **pair k is exactly scene k's travel endpoints**, so a VLM shown the pair writes scene k's transition prompt. Drive `index` with an incrementing INT primitive across queue cycles; `total_pairs` (= batch − 1) is the cycle bound.
+
+| Input | Default | Description |
+|---|---|---|
+| `index` | 1 | 1-based pair index (clamped to last valid pair) |
+| `direction` | horizontal | earlier keyframe left/top, later right/bottom — use **vertical** for landscape keyframes (near-square composite preserves panel detail through vision-encoder resizing) |
+| `gap` | 8 | Black divider px between panels — helps the VLM read two distinct panels |
+
+**Outputs:** `image`, `pair_info` (e.g. `pair 2/3: keyframe 2 → 3`), `total_pairs`.
+
 ---
 
 ### LTX Audio Latent Trim
@@ -190,10 +220,13 @@ AV-aware wrapper around the LTX latent upscale model. Upsamples the video compon
 ### LTX AV Latent Upsampler (Tiled)
 Temporally tiled variant: overlapping temporal tiles are upsampled on GPU and blended back with a linear crossfade. Viable when the result feeds a low-sigma refinement pass, which smooths residual tile-statistics differences. Use the non-tiled version when exact full-tensor statistics matter.
 
+**Supports both spatial and temporal upscalers — auto-detected** from the first tile's output shape (`L → L` spatial; `L → 2L−1` temporal, per the first-frame asymmetry: the LTX temporal upsampler doubles the pixel timeline, so `T` latents become `2T−1`). In temporal mode, tiles are anchored at `2×` their input position and each non-first tile's head latents are dropped (`head_trim`) — tile heads are malformed video-start latents; the previous tile owns that region and the crossfade spans the remaining `2·overlap−1−head_trim` latents. See [SPEC_TILED_TEMPORAL.md](SPEC_TILED_TEMPORAL.md). Temporal output is 50 fps material — single-shot refinement only (the AV Looping Sampler's audio math is 25 fps).
+
 | Input | Default | Description |
 |---|---|---|
 | `tile_frames` | 16 | Latent frames per temporal tile |
 | `tile_overlap` | 4 | Latent frames of blend overlap |
+| `head_trim` | 2 | Temporal mode only (ignored in spatial): output latents dropped from each non-first tile's head. Raise (with `tile_overlap`) if tile joins show motion stutter |
 
 ### LTX AV Latent Check
 Verifies that the video and audio components of a combined AV NestedTensor are time-matched. Reports video latent frames, audio latent frames, expected audio frames (`(T_v − 1) × 8 + 1` pixel frames at 25 audio latents/second), the delta, and an `is_matched` boolean. Passes the latent through unchanged.

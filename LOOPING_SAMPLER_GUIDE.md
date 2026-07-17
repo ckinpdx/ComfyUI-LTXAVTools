@@ -377,6 +377,7 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Symptom | First lever |
 |---|---|
 | Lips decouple from dialog in some segments | overlap strengths → 1.0/1.0 |
+| No movement — video holds the still (same image used as all keyframes) | `cond_image_strength` → ~0.5 — identical hard anchors at every boundary make stasis the optimal trajectory (staying on the image satisfies every constraint); at 0.5 they act as look-lock attractors and motion returns. Distinct travel keyframes keep 1.0 (arrival is the point) |
 | Weak/soft lipsync in chunk 0 only | anchor-beat segment 1, or condition the audio |
 | Subject snaps/teleports at ~boundary times | prompt N+1 assumes a state chunk N didn't reach; overlap strength |
 | Subject slowly drifts out of frame | locomotion in prompt; add stopped beats, slow pace |
