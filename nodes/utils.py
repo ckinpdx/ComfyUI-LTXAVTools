@@ -286,6 +286,16 @@ class LTXVAVLatentUpsamplerTiled:
                     "default": 4, "min": 1, "max": 64, "step": 1,
                     "tooltip": "Latent frames of overlap between tiles used for blending.",
                 }),
+                "head_trim": ("INT", {
+                    "default": 2, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "TEMPORAL upscalers only (auto-detected; ignored in "
+                               "spatial mode): output latents dropped from each "
+                               "non-first tile's head. Tile heads are malformed "
+                               "video-start latents (first-frame asymmetry) — the "
+                               "previous tile owns that region instead. Raise if "
+                               "tile joins show motion stutter (raise tile_overlap "
+                               "with it: blend span = 2*overlap-1-head_trim).",
+                }),
             }
         }
 
@@ -293,7 +303,8 @@ class LTXVAVLatentUpsamplerTiled:
     FUNCTION      = "upsample_latent"
     CATEGORY      = "LTXAVTools/utils"
 
-    def upsample_latent(self, samples, upscale_model, vae, tile_frames, tile_overlap):
+    def upsample_latent(self, samples, upscale_model, vae, tile_frames, tile_overlap,
+                        head_trim=2):
         raw   = samples["samples"]
         is_av = _HAS_NESTED and isinstance(raw, NestedTensor)
 
@@ -315,6 +326,8 @@ class LTXVAVLatentUpsamplerTiled:
 
         result         = None
         result_weights = None
+        temporal_mode  = None   # auto-detected from the first tile's output shape
+        T_out          = None
 
         upscale_model.to(gpu_dev)
         try:
@@ -322,35 +335,106 @@ class LTXVAVLatentUpsamplerTiled:
             while t_start < T:
                 t_end  = min(t_start + tile_frames, T)
                 tile_v = video[:, :, t_start:t_end]
+                L      = t_end - t_start
 
                 tile_un  = stats.un_normalize(tile_v).to(dtype=model_dtype, device=gpu_dev)
                 up_tile  = upscale_model(tile_un)
                 up_tile  = stats.normalize(up_tile).to(dtype=input_dtype, device=inter_dev)
 
+                # Mode detection (SPEC_TILED_TEMPORAL.md): spatial upscalers keep
+                # T (L -> L); the temporal upscaler doubles the pixel timeline
+                # (L -> 2L-1 latents, first-frame asymmetry).
+                up_T = up_tile.shape[2]
+                if temporal_mode is None:
+                    if up_T == L:
+                        temporal_mode = False
+                        T_out = T
+                    elif up_T == 2 * L - 1:
+                        temporal_mode = True
+                        T_out = 2 * T - 1
+                        if 2 * tile_overlap - 1 - head_trim < 1:
+                            raise ValueError(
+                                f"[LTXVAVLatentUpsamplerTiled] temporal mode needs a "
+                                f"blend span of at least 1 latent: 2*tile_overlap-1-"
+                                f"head_trim = {2 * tile_overlap - 1 - head_trim}. "
+                                f"Raise tile_overlap or lower head_trim."
+                            )
+                        print(f"[LTXVAVLatentUpsamplerTiled] TEMPORAL upscaler "
+                              f"detected ({L} -> {up_T}): output {T_out} latents, "
+                              f"head_trim {head_trim}.")
+                    else:
+                        raise ValueError(
+                            f"[LTXVAVLatentUpsamplerTiled] unsupported temporal "
+                            f"mapping {L} -> {up_T}. Supported: L -> L (spatial) "
+                            f"and L -> 2L-1 (temporal 2x)."
+                        )
+                else:
+                    expected = (2 * L - 1) if temporal_mode else L
+                    if up_T != expected:
+                        raise ValueError(
+                            f"[LTXVAVLatentUpsamplerTiled] inconsistent tile output: "
+                            f"expected {expected} latents for a {L}-latent tile, got {up_T}."
+                        )
+
                 if result is None:
                     B, C, _, H_up, W_up = up_tile.shape
-                    result         = torch.zeros(B, C, T, H_up, W_up,
+                    result         = torch.zeros(B, C, T_out, H_up, W_up,
                                                  device=inter_dev, dtype=input_dtype)
-                    result_weights = torch.zeros(B, 1, T, 1, 1,
+                    result_weights = torch.zeros(B, 1, T_out, 1, 1,
                                                  device=inter_dev, dtype=input_dtype)
 
-                tile_T  = t_end - t_start
-                w       = torch.ones(tile_T, device=inter_dev, dtype=input_dtype)
-                if t_start > 0:
-                    w[:tile_overlap] = torch.linspace(0, 1, tile_overlap,
+                if not temporal_mode:
+                    # --- spatial path (unchanged) ---
+                    tile_T  = t_end - t_start
+                    w       = torch.ones(tile_T, device=inter_dev, dtype=input_dtype)
+                    if t_start > 0:
+                        w[:tile_overlap] = torch.linspace(0, 1, tile_overlap,
+                                                          device=inter_dev, dtype=input_dtype)
+                    if t_end < T:
+                        w[-tile_overlap:] = torch.minimum(
+                            w[-tile_overlap:],
+                            torch.linspace(1, 0, tile_overlap, device=inter_dev, dtype=input_dtype),
+                        )
+
+                    w = w.view(1, 1, tile_T, 1, 1)
+                    result[:, :, t_start:t_end]         += up_tile * w
+                    result_weights[:, :, t_start:t_end] += w
+
+                    print(f"[LTXVAVLatentUpsamplerTiled] tile [{t_start},{t_end}) "
+                          f"of {T} latent frames")
+                else:
+                    # --- temporal path ---
+                    # Anchor mapping: input latent t <-> output latent 2t. A tile
+                    # at t_start lands at output [2*t_start, 2*t_start + 2L-1).
+                    # Non-first tiles: drop head_trim malformed head latents (tile
+                    # heads are video-start latents); the previous tile owns that
+                    # region. Ramp-in spans the remaining output overlap and ends
+                    # exactly where the previous tile's data ends.
+                    g0   = 2 * t_start
+                    trim = head_trim if t_start > 0 else 0
+                    tile_out = up_tile[:, :, trim:]
+                    g0  += trim
+                    written = tile_out.shape[2]
+                    ov_out  = 2 * tile_overlap - 1
+
+                    w = torch.ones(written, device=inter_dev, dtype=input_dtype)
+                    if t_start > 0:
+                        blend_in = ov_out - trim
+                        w[:blend_in] = torch.linspace(0, 1, blend_in,
                                                       device=inter_dev, dtype=input_dtype)
-                if t_end < T:
-                    w[-tile_overlap:] = torch.minimum(
-                        w[-tile_overlap:],
-                        torch.linspace(1, 0, tile_overlap, device=inter_dev, dtype=input_dtype),
-                    )
+                    if t_end < T:
+                        w[-ov_out:] = torch.minimum(
+                            w[-ov_out:],
+                            torch.linspace(1, 0, ov_out, device=inter_dev, dtype=input_dtype),
+                        )
 
-                w = w.view(1, 1, tile_T, 1, 1)
-                result[:, :, t_start:t_end]         += up_tile * w
-                result_weights[:, :, t_start:t_end] += w
+                    w = w.view(1, 1, written, 1, 1)
+                    result[:, :, g0:g0 + written]         += tile_out * w
+                    result_weights[:, :, g0:g0 + written] += w
 
-                print(f"[LTXVAVLatentUpsamplerTiled] tile [{t_start},{t_end}) "
-                      f"of {T} latent frames")
+                    print(f"[LTXVAVLatentUpsamplerTiled] temporal tile "
+                          f"[{t_start},{t_end}) of {T} -> out [{g0},{g0 + written}) "
+                          f"of {T_out} (trim {trim})")
 
                 if t_end >= T:
                     break
@@ -371,6 +455,81 @@ class LTXVAVLatentUpsamplerTiled:
         return (out,)
 
 
+class LTXKeyframePairConcat:
+    """
+    Emits consecutive keyframe pairs as one image, for vision-LLM prompting.
+
+    Cycle 1 concatenates keyframes 1+2, cycle 2 -> 2+3, and so on — pair k is
+    exactly scene k's travel endpoints under the end-anchored keyframe plan
+    (LTXKeyframePlanner), so a VLM shown the pair can write scene k's
+    transition prompt. Drive `index` with an incrementing INT primitive
+    (control_after_generate) to walk the batch across queue cycles;
+    `total_pairs` gives the cycle bound.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Keyframe batch, in plan order."}),
+                "index": ("INT", {
+                    "default": 1, "min": 1, "max": 10000,
+                    "tooltip": "1-based pair index: 1 -> keyframes 1+2, 2 -> 2+3… "
+                               "Clamped to the last valid pair.",
+                }),
+                "direction": (["horizontal", "vertical"], {
+                    "default": "horizontal",
+                    "tooltip": "horizontal: earlier keyframe LEFT, later RIGHT. "
+                               "vertical: earlier TOP, later BOTTOM.",
+                }),
+                "gap": ("INT", {
+                    "default": 8, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "Black divider between the two panels (pixels). "
+                               "Helps a VLM read them as two distinct panels.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT")
+    RETURN_NAMES = ("image", "pair_info", "total_pairs")
+    FUNCTION     = "concat"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Concatenates consecutive images from a batch (index 1 -> images 1+2, "
+        "index 2 -> 2+3…) for vision-LLM scene/transition prompting. Pair k = "
+        "scene k's endpoints under the end-anchored keyframe plan."
+    )
+
+    def concat(self, images, index, direction, gap):
+        n = images.shape[0]
+        if n < 2:
+            print("[LTXKeyframePairConcat] batch has fewer than 2 images — "
+                  "passing the single image through.")
+            return (images[:1], "single image (no pair)", 0)
+
+        total_pairs = n - 1
+        i = max(1, min(index, total_pairs))
+        if i != index:
+            print(f"[LTXKeyframePairConcat] index {index} clamped to {i} "
+                  f"(batch of {n} -> {total_pairs} pairs).")
+
+        a = images[i - 1]   # [H, W, C]
+        b = images[i]
+        dim = 1 if direction == "horizontal" else 0
+
+        parts = [a]
+        if gap > 0:
+            gap_shape = list(a.shape)
+            gap_shape[dim] = gap
+            parts.append(torch.zeros(gap_shape, device=a.device, dtype=a.dtype))
+        parts.append(b)
+
+        out  = torch.cat(parts, dim=dim).unsqueeze(0)
+        info = f"pair {i}/{total_pairs}: keyframe {i} -> {i + 1} ({direction})"
+        print(f"[LTXKeyframePairConcat] {info}")
+        return (out, info, total_pairs)
+
+
 NODE_CLASS_MAPPINGS = {
     "PreviewImagePassthrough":          PreviewImagePassthrough,
     "LTXAVLatentCheck":                 LTXAVLatentCheck,
@@ -378,6 +537,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXAudioLatentPad":                LTXAudioLatentPad,
     "LTXVAVLatentUpsampler":            LTXVAVLatentUpsampler,
     "LTXVAVLatentUpsamplerTiled":       LTXVAVLatentUpsamplerTiled,
+    "LTXKeyframePairConcat":            LTXKeyframePairConcat,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -387,4 +547,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXAudioLatentPad":                "LTX Audio Latent Pad",
     "LTXVAVLatentUpsampler":            "LTX AV Latent Upsampler",
     "LTXVAVLatentUpsamplerTiled":       "LTX AV Latent Upsampler (Tiled)",
+    "LTXKeyframePairConcat":            "LTX Keyframe Pair Concat",
 }
