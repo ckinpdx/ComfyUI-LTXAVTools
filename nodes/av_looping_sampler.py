@@ -307,6 +307,15 @@ class LTXVAVLoopingSampler:
         latent_tensor = latent_dict["samples"]
         guide_mask    = guide_latent_dict.get("noise_mask", None)
 
+        def _kf_count(cond):
+            for t in cond:
+                kf = t[1].get("keyframe_idxs")
+                if kf is not None:
+                    return kf.shape[2]
+            return 0
+
+        kf_before = _kf_count(positive)
+
         positive, negative, latent_tensor, noise_mask = LTXVAddGuide.append_keyframe(
             positive=positive, negative=negative,
             frame_idx=frame_idx,
@@ -318,19 +327,24 @@ class LTXVAVLoopingSampler:
             guide_mask=guide_mask,
         )
         # Register a guide_attention_entry so all guides (overlap + image keyframes)
-        # are consistent. Without this, mixing append_keyframe and LTXVAddGuide.execute
-        # in the same chunk produces a pre_filter_counts / kf_grid_mask mismatch.
-        pre_filter_count = guide.shape[2] * guide.shape[3] * guide.shape[4]
-        positive, negative = _append_guide_attention_entry(
-            positive, negative, pre_filter_count, list(guide.shape[2:]), strength,
-        )
-
-        kf_tokens = 0
-        for t in positive:
-            kf = t[1].get("keyframe_idxs")
-            if kf is not None:
-                kf_tokens = kf.shape[2]
-                break
+        # are consistent with core's pre_filter_counts / kf_grid_mask validation.
+        #
+        # MEASURED, not predicted: pre_filter_count = the keyframe tokens
+        # append_keyframe ACTUALLY added, read from the conditioning delta.
+        # Core's frame accounting has changed under this function before
+        # (2026-07 update: unconditional append + causal_fix trimming) and any
+        # hardcoded formula silently diverges when it changes again — the delta
+        # partitions the kf grid mask correctly by construction.
+        kf_tokens = _kf_count(positive)
+        pre_filter_count = kf_tokens - kf_before
+        if pre_filter_count > 0:
+            positive, negative = _append_guide_attention_entry(
+                positive, negative, pre_filter_count, list(guide.shape[2:]), strength,
+            )
+        else:
+            print(f"[LTXVAVLoopingSampler] guide at latent_idx {latent_idx} appended "
+                  f"no keyframe tokens (in-place conditioning) — no attention entry "
+                  f"registered.")
         print(
             f"[LTXVAVLoopingSampler] guide appended: {guide.shape[2]} latents "
             f"({guide.shape[3]}x{guide.shape[4]}) at latent_idx {latent_idx} "
