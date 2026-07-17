@@ -251,6 +251,15 @@ class LTXVAVLoopingSampler:
                                "no re-sampling of the prior). `latents` then defines only "
                                "the NEW region to generate. Output is prior + continuation.",
                 }),
+                "optional_ref_audio_bank": ("LTXAV_REF_BANK", {
+                    "tooltip": "Carry-swap voice identity from LTX AV Reference Audio "
+                               "Bank. Per the bank's schedule, extend chunks get their "
+                               "frozen audio carry replaced by the scheduled reference "
+                               "voice — sampling context only, never in the output (the "
+                               "keep-verbatim stitch retains the accumulator's real "
+                               "tail). Swaps should land at scripted gaps; see "
+                               "SPEC_NEG_REF_AUDIO.md.",
+                }),
             },
         }
 
@@ -655,6 +664,7 @@ class LTXVAVLoopingSampler:
         audio_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
+        ref_audio_swap=None,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -741,7 +751,35 @@ class LTXVAVLoopingSampler:
         T_a_chunk = _audio_frames_for_video_chunk(T_v_chunk, fps)
         T_a_new   = max(1, T_a_chunk - a_overlap)
 
-        audio_carry = audio_acc[:, :, -a_overlap:, :].clone()
+        # Carry-swap (SPEC_NEG_REF_AUDIO.md): fill the frozen carry slot with the
+        # scheduled reference voice instead of the accumulator tail. The chunk
+        # then generates as if the ref voice "was just speaking." The real tail
+        # is never modified — it stays in audio_acc and the keep-verbatim stitch
+        # keeps it in the output; the swapped carry is sampling context only.
+        if ref_audio_swap is not None:
+            ref = ref_audio_swap.to(device=dev, dtype=dty)
+            if ref.shape[1] != C_a or ref.shape[3] != F_s:
+                raise ValueError(
+                    f"[LTXVAVLoopingSampler] ref audio latent shape mismatch: "
+                    f"got C={ref.shape[1]} F={ref.shape[3]}, expected C={C_a} "
+                    f"F={F_s}. Encode the reference with the same audio VAE as "
+                    f"the generation."
+                )
+            if ref.shape[2] < a_overlap:
+                reps = -(-a_overlap // ref.shape[2])  # ceil div
+                print(f"[LTXVAVLoopingSampler] ref voice ({ref.shape[2]} frames) "
+                      f"shorter than audio overlap ({a_overlap}) — tiling x{reps}. "
+                      f"Use a longer reference clip to avoid an audible loop in "
+                      f"the context.")
+                ref = ref.repeat(1, 1, reps, 1)
+            audio_carry = ref[:, :, :a_overlap, :].clone()
+            if audio_carry.shape[0] != audio_acc.shape[0]:
+                audio_carry = audio_carry.expand(audio_acc.shape[0], -1, -1, -1).clone()
+            print(f"[LTXVAVLoopingSampler] chunk {chunk_index}: audio carry swapped "
+                  f"to reference voice ({a_overlap} frames, ~{a_overlap / 25.0:.2f}s "
+                  f"of context). Real tail preserved in output.")
+        else:
+            audio_carry = audio_acc[:, :, -a_overlap:, :].clone()
 
         # new-region audio: conditioned on input if audio_cond_strength > 0
         a_global_new_start = audio_acc.shape[2]
@@ -826,7 +864,12 @@ class LTXVAVLoopingSampler:
         # Both paths yield the same length:
         #   verbatim: acc + (T_a_chunk - a_overlap) = acc + T_a_new
         #   regen:    (acc - a_overlap) + T_a_chunk = acc + T_a_new
-        if audio_overlap_cond_strength >= 1.0:
+        #
+        # A carry-swap chunk MUST take the verbatim path regardless of strength:
+        # the regen path splices the chunk's carry region into the output, which
+        # would leak the reference voice onto the timeline. Verbatim keeps the
+        # accumulator's real tail — the ref stays context-only.
+        if audio_overlap_cond_strength >= 1.0 or ref_audio_swap is not None:
             audio_result = torch.cat([audio_acc, audio_body[:, :, a_overlap:, :]], dim=2)
         else:
             audio_head   = audio_acc[:, :, :-a_overlap, :]
@@ -859,6 +902,7 @@ class LTXVAVLoopingSampler:
         adain_factor=0.0, normalizing_latents=None,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         prior_v_frames=0, prior_a_frames=0,
+        ref_bank=None,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         chunk_idx    = 0
@@ -958,6 +1002,27 @@ class LTXVAVLoopingSampler:
                 if adain_factor > 0.0 and normalizing_latents is None:
                     adain_ref = video_acc["samples"].detach()
             else:
+                # Carry-swap voice reference (SPEC_NEG_REF_AUDIO.md): decide
+                # whether this extend chunk's frozen audio carry is replaced by
+                # the scheduled reference voice. on_change swaps only at voice
+                # changes (turn seams); always swaps every extend chunk. Chunk 0
+                # has no carry slot and never swaps; a continuation's first
+                # chunk (chunk_idx 0 but v_start > 0) also never swaps under
+                # on_change because the prior's voice is unknown to the schedule.
+                ref_audio_swap = None
+                if ref_bank is not None:
+                    sched = ref_bank["schedule"]
+                    voice = sched[min(chunk_idx, len(sched) - 1)]
+                    prev  = sched[min(chunk_idx - 1, len(sched) - 1)] if chunk_idx > 0 else None
+                    if ref_bank.get("swap_mode", "on_change") == "always" or (
+                        prev is not None and voice != prev
+                    ):
+                        ref_audio_swap = ref_bank["latents"].get(voice)
+                        if ref_audio_swap is not None:
+                            print(f"[LTXVAVLoopingSampler] chunk {chunk_idx}: audio carry "
+                                  f"SWAP scheduled -> voice {voice}"
+                                  + (f" (was voice {prev})" if prev is not None else ""))
+
                 video_acc, audio_acc = self._sample_extend_chunk(
                     **shared,
                     video_acc=video_acc, audio_acc=audio_acc,
@@ -969,6 +1034,7 @@ class LTXVAVLoopingSampler:
                     cond_image_strength=cond_image_strength,
                     chunk_index=chunk_idx,
                     adain_ref=chunk_adain_ref, adain_per_frame=adain_per_frame,
+                    ref_audio_swap=ref_audio_swap,
                 )
             chunk_idx += 1
 
@@ -1001,6 +1067,7 @@ class LTXVAVLoopingSampler:
         optional_phase2_guider=None,
         phase2_start_step=0,
         optional_prior_av_latent=None,
+        optional_ref_audio_bank=None,
     ):
         samples = latents["samples"]
         if not isinstance(samples, NestedTensor):
@@ -1187,6 +1254,7 @@ class LTXVAVLoopingSampler:
                     phase2_start_step=phase2_start_step,
                     prior_v_frames=prior_v_frames,
                     prior_a_frames=prior_a_frames,
+                    ref_bank=optional_ref_audio_bank,
                 )
 
                 # accumulate video with spatial weights
