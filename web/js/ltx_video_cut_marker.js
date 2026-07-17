@@ -38,6 +38,16 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "LTXVideoCutMarker") return;
 
+        // Fires after serialized widget values are applied on workflow
+        // load/refresh — reload the media with the RESTORED filename so the
+        // saved schedule is restored against the right file.
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            this._cutMarkerReload?.();
+            return r;
+        };
+
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
@@ -53,6 +63,7 @@ app.registerExtension({
             let selected = -1;      // cut index, or END_SEL for the end marker
             let endLat = null;      // usable latent count when an end marker is set
             let detectedFps = null;
+            let scheduleMismatch = false;   // stored schedule longer than loaded media
 
             const fps = () => (fpsWidget?.value > 0 ? fpsWidget.value : 25.0);
             const duration = () => (isFinite(video.duration) ? video.duration : 0);
@@ -288,6 +299,7 @@ app.registerExtension({
             }
             function syncWidget() {
                 if (!duration()) return;
+                scheduleMismatch = false;   // an explicit (re-)emit supersedes the warning
                 const Ls = boundaryLatents();
                 const lengths = [];
                 let prev = 0;
@@ -308,6 +320,7 @@ app.registerExtension({
                     .filter((n) => n > 0);
                 // A schedule summing short of the video's length implies an end marker.
                 const total = latents.reduce((a, b) => a + b, 0);
+                scheduleMismatch = total > totalLatents();
                 endLat = (total >= 1 && total < totalLatents()) ? total : null;
                 cuts = [];
                 let cum = 0;
@@ -320,7 +333,17 @@ app.registerExtension({
                 }
                 cuts.sort((a, b) => a.t - b.t);
                 selected = -1;
-                syncWidget();   // re-emit against THIS video's actual length
+                // Re-emit ONLY when the stored schedule fits the loaded media.
+                // A schedule LONGER than the media means the wrong (or changed)
+                // file is loaded — rewriting the widget then would destroy the
+                // user's saved schedule. Keep the string untouched and warn.
+                if (!scheduleMismatch) {
+                    syncWidget();
+                } else {
+                    console.warn("[CutMarker] saved schedule (" + total + " latents) "
+                        + "exceeds loaded media (" + totalLatents() + ") — string "
+                        + "preserved, not re-emitted. Wrong video loaded?");
+                }
                 draw();
             }
 
@@ -644,6 +667,10 @@ app.registerExtension({
                 }
                 lines.push(`scene_lengths: ${scenesWidget.value || "(none)"}  |  ` +
                            `${(scenesWidget.value || "").split("|").filter(Boolean).length} scenes`);
+                if (scheduleMismatch) {
+                    lines.push("⚠ saved schedule exceeds this media's length — string " +
+                               "preserved, markers show what fits. Wrong file loaded?");
+                }
                 readout.textContent = lines.join("\n");
             }
 
@@ -690,7 +717,7 @@ app.registerExtension({
                 return [
                     video.currentTime.toFixed(3), duration().toFixed(3),
                     fps(), detectedFps ?? 0, selected, endLat ?? -1, dragging,
-                    peaks ? 1 : 0, video.videoWidth,
+                    peaks ? 1 : 0, video.videoWidth, scheduleMismatch ? 1 : 0,
                     cuts.map((c) => c.t.toFixed(3)).join(","),
                     scenesWidget.value,
                     canvas.clientWidth, window.devicePixelRatio || 1,
@@ -719,6 +746,13 @@ app.registerExtension({
                 teardown();
                 return prevOnRemoved?.apply(this, arguments);
             };
+
+            // Exposed for the onConfigure hook: on workflow load/refresh,
+            // onNodeCreated runs BEFORE serialized widget values are applied,
+            // so the loadVideo() below fires with the combo's DEFAULT value.
+            // onConfigure re-runs it with the restored filename (and metadata
+            // then triggers restoreFromWidget against the right media).
+            node._cutMarkerReload = loadVideo;
 
             loadVideo();
             return r;
