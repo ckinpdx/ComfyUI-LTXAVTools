@@ -204,20 +204,37 @@ is cleaner than relying on zeros.
 
 ### Voice identity across separate generations
 
-`LTX Add Audio Latent Guide` injects reference audio as `ref_audio` tokens (clean,
-pre-t = 0) at the conditioning level — the audio analog of image reference conditioning.
-Use when separate videos of the same character should share a voice without conditioning
-on a full track.
+**The only working voice lock is the ID-LoRA path**: core `LTXVReferenceAudio`
+(~5s clean reference clip) with the TalkVid ID-LoRA loaded. It sets `ref_audio`
+and patches the model with an identity-guidance pass (extra forward per step —
+wire into stage 1 only; restrict via `start/end_percent` if compute matters).
+ID-LoRA checkpoints expect the structured prompt format `[VISUAL]: … [SPEECH]:
+exact words [SOUNDS]: voice style + ambient`; keep the `[SOUNDS]` voice
+descriptor identical across segments. The sampler carries `ref_audio` onto
+per-chunk prompts automatically. LoRA loading (KJ per-block loader): the
+voice lives in the audio-OUTPUT groups — `audio` + `video_to_audio` (+ `other`)
+at 1.0; `video` and `audio_to_video` can be zeroed for a visuals-untouched lock.
 
-For ID-LoRA voice locking, use the core `LTXVReferenceAudio` node instead (~5s clean
-reference clip): it sets `ref_audio` and patches the model with an identity-guidance
-pass (extra forward pass per step — wire into stage 1 only; restrict via
-`start/end_percent` if compute matters). ID-LoRA checkpoints expect the structured
-prompt format `[VISUAL]: … [SPEECH]: exact words [SOUNDS]: voice style + ambient`;
-keep the `[SOUNDS]` voice descriptor identical across segments. The sampler carries
-`ref_audio` onto per-chunk prompts automatically.
+**What does NOT work (all empirically dead, 2026-07):** the base model does not
+adopt voice identity from context — three mechanisms tested and failed:
+`LTX Add Audio Latent Guide` without the ID-LoRA (the `ref_audio`
+negative-coordinate placement is an ID-LoRA training convention; the node is
+marked ARTIFACT), carry-swap reference audio (with and without v2a severed —
+the ref transfers only via forced utterance-continuation, never as identity).
+Voice consistency within a generation is content lineage, not timbre adoption;
+across generations, only the trained pathway transfers a voice.
 
 ### Multi-speaker dialog (turn-based)
+
+> **⚠️ Status (2026-07): multi-voice is ABANDONED as non-functional** — the
+> ID-LoRA's reference is globally amplified and inherently single-voice; per-chunk
+> switching degraded in testing (garbled onsets, wrong-speaker bleed). HOWEVER:
+> that testing predates the keep-carry-verbatim stitch and the turn-seam
+> choreography rules, both of which independently attack the observed failure
+> modes — a retest under current conditions is pending and the machinery below
+> remains installed for it. Mixed-gender pairs are the most promising case
+> (gender is a hard prior; text switches the voice categorically). Single-ref
+> use of the Multi node is a working drop-in for the core node.
 
 `LTX AV Reference Audio Multi (ID-LoRA)` + `LTX AV Speaker Prompt Provider` extend
 ID-LoRA voice locking to up to four speakers, one per chunk. In the script, write
@@ -267,6 +284,27 @@ steps lets textures diverge from the guide. The sampler splits the schedule and 
 segments back-to-back.
 
 ---
+
+### Small-grid IC references (`guiding_downscale_factor`)
+
+Some IC-LoRAs are trained on a **reduced reference grid** — their safetensors
+metadata declares `reference_downscale_factor` (pixel spatial upscaler x2 = 2,
+x4 = 4; read it with `LTX LoRA Metadata Reader`, don't trust example-workflow
+widgets). For these, feed the guiding latent at `gen_dims/factor` — for a 2×
+upscale pass that is the **stage-1 latent directly, no resizing** — and set
+`guiding_downscale_factor` (wire it from the Metadata Reader so it can't drift).
+Each chunk's guide slice is dilated onto the full grid (holes filtered before
+attention, so overhead is only the small-grid token count) with RoPE spans
+covering factor-larger patches — the trained geometry. A dense full-res
+reference leaves these LoRAs **silently inert**; the wrong factor errors with
+expected-vs-got dims. Factor 1 = normal dense references (Ingredients,
+CrossView, depth/pose). Not compatible with spatial tiling >1×1 yet.
+
+**Conditioning hygiene (all IC use):** feed the sampler clean text encodes only.
+Conditioning that passed through an official guide node upstream carries
+full-timeline `keyframe_idxs`/attention entries that cannot survive chunk
+remapping — guaranteed bookkeeping crash. References enter via
+`optional_guiding_latents`, never via pre-built guide conditioning.
 
 ## 7b. Dual-sampler schedules (phase 2)
 
@@ -330,6 +368,20 @@ motion, framing, pacing. Stage 2 (latent-upsampled, denoise ≈ 0.3, `audio_cond
   refine smooths tile statistics); use the non-tiled one otherwise.
 
 ---
+
+### Pixel-upscale stage 2 (IC-LoRA, chunked)
+
+The generative alternative to the latent-upsampler refine — a **full generation
+from noise** at target res with stage 1 as small-grid in-context reference
+(§7). Wiring: empty AV latent at target res (stage-1 audio concatenated,
+`audio_cond_strength 1.0`); stage-1 video latent → `optional_guiding_latents`
+directly; same `scene_lengths` and per-chunk prompts as stage 1 (seams align →
+each chunk references its own stage-1 content); upscaler LoRA loaded with
+factor wired from metadata; `guiding_strength 1.0` (loosen adherence via
+`guiding_end_step`, never sub-1.0 strength); full-gen sigma schedule, not a
+low-sigma tail. Stage 1 can drop to very low res (~quarter / ~280p — the
+3-stage dimension calculator's ÷128 constraint is exactly the x4 divisibility
+requirement): structure and AV sync commit there, detail is synthesized here.
 
 ## 11. Seeds
 
@@ -395,3 +447,8 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Seam "speaks" the next chunk's prompt / re-voiced boundary | keep-carry-verbatim stitch (fixed 2026-07-15) — runs automatically at `audio_overlap_cond_strength ≥ 1.0`; the frozen carry is no longer regenerated under the next chunk's conditioning. Also kills static-image burn-in and continuation gibberish. |
 | Gibberish generated speech over a guide video (changing the words) | the guide's visible lips out-muscle the text via v2a — set `v2a_cross_attn = False` on the **LTX AV Cross-Attention Toggle** node. Text drives the audio; a2v resyncs the mouth. Only bites during generation; irrelevant with input audio. |
 | Lips move during silence over a guide video | the guide's original lip motion bleeds through where the new audio is silent — fill the runtime with dialog (no dead air), and/or free the mouth more (higher CrossView regeneration, lower guide/overlap strength) so a2v dominates it. |
+| Crash: `expanded size of tensor … must match` inside attention, with MultimodalGuider | STG perturbed pass × any sub-1.0 guide strength (incl. `cond_image_strength 0.5`) breaks core's guide-mask attention. Set `perturb_attn=false`/`stg=0` in GuiderParameters (keeps per-modality CFG), or keep all guide strengths at 1.0 and window via `guiding_start/end_step` |
+| Crash: `guide pre_filter_counts != keyframe grid mask length` | stale guide conditioning from an upstream guide node (LTXVAddGuide / IC-LoRA guide) — feed the sampler clean text encodes; references go through `optional_guiding_latents` only |
+| Crash: `size of tensor a … must match b` in `_linear_overlap_blend` with a prior latent | the continuation prior is shorter than `temporal_overlap` — use a prior of at least the overlap in pixel frames (≥ ~2s at overlap 48; more gives the carry real substance) |
+| Keyframes silently ignored (unconditioned output despite indices set) | `optional_cond_images` missing/bypassed — indices without images degrade silently by design. Also check count: images pair with indices via zip, and the shorter list wins (extra indices dropped without warning; Keyframe Planner's `count` output is the check) |
+| Small-grid IC-LoRA (pixel upscaler) has no effect | reference fed dense/full-res — these LoRAs need `guiding_downscale_factor` set (from metadata) with the guide at `gen_dims/factor` (§7 small-grid) |
