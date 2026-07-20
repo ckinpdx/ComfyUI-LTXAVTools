@@ -3,6 +3,30 @@
 ## 1.1.0 — 2026-07-15
 
 ### Added
+- **LTX AV Streaming Decode & Save** (2026-07-17/18, validated): chunked
+  causal-exact VAE decode piped directly into ffmpeg — constant RAM at any
+  video length; audio muxed from decoded AUDIO; inline player on finish.
+  Slower than the normal decode path — use only where length requires it.
+- **LTX LoRA Metadata Reader** (2026-07-18, validated): safetensors-header
+  reader (no weight load). One combo drives loader (`lora_path` →
+  `opt_lora_path`) and sampler (`latent_downscale_factor` →
+  `guiding_downscale_factor`).
+- **AV Looping Sampler: small-grid IC-LoRA references** (2026-07-17/18,
+  validated): appended `guiding_downscale_factor` (FLOAT, metadata-wireable).
+  Per-chunk guide dilation + RoPE patch-span adjustment — the trained
+  reference geometry of the pixel spatial upscaler IC-LoRAs (x2/x4), enabling
+  chunked long-form pixel upscaling. Factor 1 = unchanged dense references.
+
+### Fixed
+- **Guide attention-entry registration is now measured, not predicted**
+  (2026-07-17): pre_filter_count read from the actual keyframe_idxs delta, so
+  registration survives core frame-accounting changes (fixes
+  `guide pre_filter_counts != keyframe grid mask length` after the 2026-07
+  ComfyUI update).
+- **Video Cut Marker: state persistence across page refresh** (2026-07-18):
+  media reloads with restored widget values via onConfigure, and restore no
+  longer rewrites the saved schedule when the loaded media doesn't match
+  (previously a refresh could silently destroy the schedule).
 - **LTX Video Cut Marker (Scenes)** (2026-07-16/17, validated): interactive
   timeline widget — video/audio loading with waveform display, latent-grid-
   snapped scene cuts, optional end marker, time-anchored emit-fps math (24→25

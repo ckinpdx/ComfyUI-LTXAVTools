@@ -77,6 +77,32 @@ Emits consecutive keyframe pairs as one composite image for **vision-LLM scene p
 
 **Outputs:** `image`, `pair_info` (e.g. `pair 2/3: keyframe 2 → 3`), `total_pairs`.
 
+### LTX LoRA Metadata Reader
+Reads a LoRA's safetensors metadata header — no weight loading, no VRAM, milliseconds. The **single point of LoRA selection** for IC-LoRA workflows: one combo drives both the loader and the sampler, so the factor can never drift from the loaded file.
+
+```
+Metadata Reader ── lora_path ─────────────▶ KJ LTX2 LoRA Loader Advanced .opt_lora_path
+              ├── latent_downscale_factor ─▶ AV Looping Sampler .guiding_downscale_factor
+              └── metadata ────────────────▶ (inspection — works on any LoRA's header)
+```
+
+The factor comes from the LoRA's own `reference_downscale_factor` metadata (pixel spatial upscaler x2 = 2, x4 = 4). When `opt_lora_path` is connected, the KJ loader's own combo is ignored.
+
+### LTX AV Streaming Decode & Save
+Long-video export without the RAM cliff: decodes the video latent in temporal chunks and pipes frames directly into a persistent ffmpeg encode — **the full pixel tensor never exists**, so RAM use is constant at any length. Each chunk decodes with `context_latents` of leading context that are trimmed from the output; because the LTX video VAE is temporally causal this makes the chunked decode **exact** (bit-identical to a full decode, no blending, no seams). Frame count preserved exactly (`(T−1)×8+1`). Shows an inline player when finished (streams from disk — previewing also costs no RAM).
+
+> **When to use:** it is **slower than the normal decode path** — reserve it for videos long enough that VAEDecode → VHS would exhaust RAM. For ordinary lengths, use the standard pipeline.
+
+| Input | Default | Description |
+|---|---|---|
+| `latent` | — | AV NestedTensor (video component used) or plain 5D video latent |
+| `chunk_latents` | 16 | Latent frames decoded per chunk (~chunk×8 pixel frames of RAM at a time) |
+| `context_latents` | 4 | Causal left-context per chunk, trimmed from output. Raise if a seam ever appears at chunk boundaries |
+| `fps` / `crf` | 25 / 19 | Encode parameters (libx264, yuv420p) |
+| `optional_audio` | — | Decoded AUDIO (via `LTXVAudioVAEDecode` — audio is tiny, decode it normally) muxed into the file |
+
+**Output:** `file_path` (STRING). Note there is deliberately no IMAGE output — pixels stream out and are gone; anything needing frames works from the latent or the saved file.
+
 ---
 
 ### LTX Audio Latent Trim
@@ -289,6 +315,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `optional_phase2_guider` | — | Guider for phase 2 (e.g. CFG 1.0 vs. phase 1's 2.0). Its conditioning is replaced by the chunk's; only guidance settings apply. Falls back to the main guider. |
 | `phase2_start_step` | 0 | Schedule step where phase 2 takes over. 0 = disabled. |
 | `optional_prior_av_latent` | — | Existing AV latent to **continue from**, treated as a prior chunk. The accumulator is seeded with it and generation continues after it via the overlap mechanism — no masks, no re-sampling of the prior. `latents` then defines only the **new** region to generate. Output is prior + continuation. |
+| `guiding_downscale_factor` | 1.0 | **Small-grid IC-LoRA reference factor** — wire from the LoRA Metadata Reader (or IC-LoRA Loader Model Only) so the LoRA's `reference_downscale_factor` metadata drives it (pixel spatial upscaler x2 = 2, x4 = 4). The guiding latent must then be `gen_dims/factor` — e.g. the stage-1 latent **directly** for a 2× pass. Each chunk's guide slice is dilated onto the full grid with RoPE-adjusted patch spans (the trained reference geometry); dilation-hole tokens are filtered before attention, so the reference overhead is only the small-grid token count. 1 = normal dense reference (Ingredients, CrossView, depth/pose). Spatial tiling >1×1 not supported with factor >1. |
 
 ### Continuing an existing video
 
