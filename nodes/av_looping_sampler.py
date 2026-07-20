@@ -260,6 +260,19 @@ class LTXVAVLoopingSampler:
                                "tail). Swaps should land at scripted gaps; see "
                                "SPEC_NEG_REF_AUDIO.md.",
                 }),
+                "guiding_downscale_factor": ("FLOAT", {
+                    "default": 1.0, "min": 1.0, "max": 8.0, "step": 1.0,
+                    "tooltip": "Small-grid IC-LoRA reference factor. Connect the "
+                               "latent_downscale_factor output of LTX IC-LoRA Loader "
+                               "Model Only so the LoRA's own metadata drives it "
+                               "(pixel spatial upscaler x2 = 2, x4 = 4). The guiding "
+                               "latent must then be gen_dims/factor (e.g. the stage-1 "
+                               "latent directly for x2). Each chunk's guide slice is "
+                               "dilated onto the full grid with RoPE-adjusted patch "
+                               "spans — the geometry these LoRAs were trained on. "
+                               "1 = normal dense reference (Ingredients, CrossView, "
+                               "depth/pose).",
+                }),
             },
         }
 
@@ -287,7 +300,8 @@ class LTXVAVLoopingSampler:
         return NestedTensor(ltxav.recombine_audio_and_video_latents(video, audio))
 
     def _add_latent_guide(self, vae, positive, negative, latent_dict,
-                          guide_latent_dict, latent_idx, strength):
+                          guide_latent_dict, latent_idx, strength,
+                          downscale_factor=1):
         """
         Add a pre-encoded video latent as a guide via LTXVAddGuide.append_keyframe.
         Does not add IC-LoRA attention entries — sufficient for overlap and
@@ -307,6 +321,18 @@ class LTXVAVLoopingSampler:
         latent_tensor = latent_dict["samples"]
         guide_mask    = guide_latent_dict.get("noise_mask", None)
 
+        # Small-grid IC-LoRA reference (e.g. the pixel spatial upscaler, whose
+        # safetensors metadata declares reference_downscale_factor 2/4): the
+        # guide arrives at gen_dims/factor and is DILATED onto the full grid —
+        # real tokens every factor-th position, holes masked -1 so the model
+        # filters them (grid_mask). append_keyframe's latent_downscale_factor
+        # then adjusts RoPE end coords so each surviving token spans a
+        # factor-larger patch — the geometry these LoRAs were trained to read.
+        # Mirrors LTXAddVideoICLoRAGuide (ComfyUI-LTXVideo iclora.py).
+        pre_dilation_shape = list(guide.shape[2:])
+        if downscale_factor > 1:
+            guide, guide_mask = LTXVAddGuide.dilate_latent(guide, downscale_factor)
+
         def _kf_count(cond):
             for t in cond:
                 kf = t[1].get("keyframe_idxs")
@@ -325,6 +351,7 @@ class LTXVAVLoopingSampler:
             strength=strength,
             scale_factors=ts,
             guide_mask=guide_mask,
+            latent_downscale_factor=downscale_factor,
         )
         # Register a guide_attention_entry so all guides (overlap + image keyframes)
         # are consistent with core's pre_filter_counts / kf_grid_mask validation.
@@ -338,8 +365,10 @@ class LTXVAVLoopingSampler:
         kf_tokens = _kf_count(positive)
         pre_filter_count = kf_tokens - kf_before
         if pre_filter_count > 0:
+            # Entry shape must be the PRE-dilation [F, H, W] (core uses it for
+            # spatial-mask downsampling); the count is the dilated token total.
             positive, negative = _append_guide_attention_entry(
-                positive, negative, pre_filter_count, list(guide.shape[2:]), strength,
+                positive, negative, pre_filter_count, pre_dilation_shape, strength,
             )
         else:
             print(f"[LTXVAVLoopingSampler] guide at latent_idx {latent_idx} appended "
@@ -557,6 +586,7 @@ class LTXVAVLoopingSampler:
         audio_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
+        guiding_downscale_factor=1,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -594,7 +624,8 @@ class LTXVAVLoopingSampler:
                 min(T_v - 1, guiding_latents["samples"].shape[2] - 1),
             )
             positive, negative, video_init = self._add_latent_guide(
-                vae, positive, negative, video_init, g_chunk, 0, guiding_strength
+                vae, positive, negative, video_init, g_chunk, 0, guiding_strength,
+                downscale_factor=guiding_downscale_factor,
             )
 
         # negative index
@@ -679,6 +710,7 @@ class LTXVAVLoopingSampler:
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         ref_audio_swap=None,
+        guiding_downscale_factor=1,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -738,6 +770,7 @@ class LTXVAVLoopingSampler:
                 vae, positive, negative, video_init, g_chunk,
                 latent_idx=overlap_video["samples"].shape[2],
                 strength=guiding_strength,
+                downscale_factor=guiding_downscale_factor,
             )
 
         if keyframes is not None and kf_idx_str:
@@ -917,6 +950,7 @@ class LTXVAVLoopingSampler:
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         prior_v_frames=0, prior_a_frames=0,
         ref_bank=None,
+        guiding_downscale_factor=1,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         chunk_idx    = 0
@@ -980,6 +1014,7 @@ class LTXVAVLoopingSampler:
                 neg_idx_latents=neg_idx_latents, neg_idx=neg_idx, neg_idx_strength=neg_idx_strength,
                 guiding_start_step=guiding_start_step, guiding_end_step=guiding_end_step,
                 guiding_latents=guiding_latents, guiding_strength=guiding_strength,
+                guiding_downscale_factor=guiding_downscale_factor,
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
                 audio_cond_strength=audio_cond_strength,
                 adain_factor=adain_factor,
@@ -1082,7 +1117,11 @@ class LTXVAVLoopingSampler:
         phase2_start_step=0,
         optional_prior_av_latent=None,
         optional_ref_audio_bank=None,
+        guiding_downscale_factor=1.0,
     ):
+        # Accepts the FLOAT latent_downscale_factor output of LTX IC-LoRA
+        # Loader Model Only (metadata-driven); integer factor internally.
+        guiding_downscale_factor = max(1, int(round(float(guiding_downscale_factor))))
         samples = latents["samples"]
         if not isinstance(samples, NestedTensor):
             raise ValueError(
@@ -1178,6 +1217,32 @@ class LTXVAVLoopingSampler:
         else:
             optional_keyframes = None
 
+        # Small-grid IC-LoRA reference validation (guiding_downscale_factor > 1)
+        if guiding_downscale_factor > 1 and optional_guiding_latents is not None:
+            if horizontal_tiles > 1 or vertical_tiles > 1:
+                raise ValueError(
+                    "[LTXVAVLoopingSampler] guiding_downscale_factor > 1 with spatial "
+                    "tiling is not supported yet — run with 1x1 spatial tiles."
+                )
+            g = optional_guiding_latents["samples"]
+            exp_h = height // guiding_downscale_factor
+            exp_w = width  // guiding_downscale_factor
+            if height % guiding_downscale_factor or width % guiding_downscale_factor:
+                raise ValueError(
+                    f"[LTXVAVLoopingSampler] gen latent {height}x{width} must be "
+                    f"divisible by guiding_downscale_factor {guiding_downscale_factor}."
+                )
+            if g.shape[3] != exp_h or g.shape[4] != exp_w:
+                raise ValueError(
+                    f"[LTXVAVLoopingSampler] small-grid guide must be gen_dims/factor: "
+                    f"expected {exp_h}x{exp_w} latent, got {g.shape[3]}x{g.shape[4]}. "
+                    f"For the x2 pixel upscaler feed the stage-1 (half-res) latent "
+                    f"directly."
+                )
+            print(f"[LTXVAVLoopingSampler] small-grid IC reference active: factor "
+                  f"{guiding_downscale_factor}, guide {g.shape[3]}x{g.shape[4]} -> "
+                  f"dilated to {height}x{width} per chunk.")
+
         # spatial tile sizes
         base_tile_h = (height + (vertical_tiles   - 1) * spatial_overlap) // vertical_tiles
         base_tile_w = (width  + (horizontal_tiles - 1) * spatial_overlap) // horizontal_tiles
@@ -1207,8 +1272,10 @@ class LTXVAVLoopingSampler:
 
                 tile_guide = None
                 if optional_guiding_latents is not None:
+                    gf = guiding_downscale_factor
                     tile_guide = {
-                        "samples": optional_guiding_latents["samples"][:, :, :, vs:ve, hs:he]
+                        "samples": optional_guiding_latents["samples"][
+                            :, :, :, vs // gf : ve // gf, hs // gf : he // gf]
                     }
 
                 tile_neg_idx = None
@@ -1269,6 +1336,7 @@ class LTXVAVLoopingSampler:
                     prior_v_frames=prior_v_frames,
                     prior_a_frames=prior_a_frames,
                     ref_bank=optional_ref_audio_bank,
+                    guiding_downscale_factor=guiding_downscale_factor,
                 )
 
                 # accumulate video with spatial weights
