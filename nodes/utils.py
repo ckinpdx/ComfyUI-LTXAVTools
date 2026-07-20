@@ -530,6 +530,265 @@ class LTXKeyframePairConcat:
         return (out, info, total_pairs)
 
 
+class LTXLoraMetadataReader:
+    """
+    Single-selection LoRA metadata reader for IC-LoRA workflows.
+
+    Reads only the safetensors JSON header (no tensor loading — milliseconds,
+    no VRAM) and emits the absolute path alongside the metadata, so ONE combo
+    drives both the loader and the sampler:
+
+        Metadata Reader ── lora_path ──▶ KJ LTX2 LoRA Loader Advanced
+                       │                 (opt_lora_path overrides its combo)
+                       └─ latent_downscale_factor ──▶ sampler
+                          guiding_downscale_factor
+
+    The factor comes from the LoRA's own reference_downscale_factor metadata
+    (pixel spatial upscaler x2 = 2, x4 = 4) — no manual sync, no drift.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        import folder_paths
+        return {
+            "required": {
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "The single point of LoRA selection: path feeds the "
+                               "loader, factor feeds the sampler.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "FLOAT", "STRING")
+    RETURN_NAMES = ("lora_path", "latent_downscale_factor", "metadata")
+    FUNCTION     = "read"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Reads a LoRA's safetensors metadata header (no weight loading). Outputs "
+        "the absolute path (wire to a loader's opt_lora_path so one combo drives "
+        "everything), the IC-LoRA reference_downscale_factor (wire to the AV "
+        "Looping Sampler's guiding_downscale_factor), and the full metadata for "
+        "inspection."
+    )
+
+    def read(self, lora_name):
+        import json
+        import struct
+        import folder_paths
+
+        path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        with open(path, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len).decode("utf-8"))
+        md = header.get("__metadata__", {}) or {}
+
+        try:
+            factor = max(1.0, float(md.get("reference_downscale_factor", 1)))
+        except (TypeError, ValueError):
+            factor = 1.0
+
+        meta_str = json.dumps(md, indent=2) if md else "(no metadata)"
+        print(f"[LTXLoraMetadataReader] {lora_name}: "
+              f"reference_downscale_factor={factor} | {len(md)} metadata keys")
+        return (path, factor, meta_str)
+
+
+class LTXAVStreamingSave:
+    """
+    Chunked VAE decode streamed straight into ffmpeg — the full pixel tensor
+    never exists. Constant RAM regardless of video length: only one chunk of
+    frames is alive at any moment, piped rawvideo into a persistent encoder.
+
+    Exactness: the LTX video VAE is CAUSAL (past-context only), so decoding a
+    slice with `context_latents` of left context and trimming the context's
+    pixels yields the same frames a full decode would — no right context, no
+    crossfade. The trim also absorbs the slice's first-frame asymmetry (its
+    first latent decodes as a 1-px video start, which lands in the discarded
+    region). Total streamed frames = (T-1)*8+1, identical to a full decode.
+
+    Audio is NOT decoded here (it is tiny — use LTXVAudioVAEDecode) — feed the
+    decoded AUDIO in and it is muxed into the file at the end.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT", {
+                    "tooltip": "AV NestedTensor (video component is used) or a "
+                               "plain 5D video latent.",
+                }),
+                "vae": ("VAE",),
+                "chunk_latents": ("INT", {
+                    "default": 16, "min": 2, "max": 256,
+                    "tooltip": "Latent frames decoded per chunk (~ chunk*8 pixel "
+                               "frames of RAM at a time).",
+                }),
+                "context_latents": ("INT", {
+                    "default": 4, "min": 1, "max": 16,
+                    "tooltip": "Left-context latents decoded with each chunk and "
+                               "trimmed. Must cover the causal VAE's temporal "
+                               "receptive field; raise if you ever see a subtle "
+                               "seam at chunk boundaries.",
+                }),
+                "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 0.01}),
+                "filename_prefix": ("STRING", {"default": "LTXAV/stream"}),
+                "crf": ("INT", {
+                    "default": 19, "min": 0, "max": 51,
+                    "tooltip": "libx264 quality (lower = better/larger).",
+                }),
+            },
+            "optional": {
+                "optional_audio": ("AUDIO", {
+                    "tooltip": "Decoded audio (LTXVAudioVAEDecode) to mux into "
+                               "the file. Omit for silent video.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    OUTPUT_NODE  = True
+    FUNCTION     = "stream_save"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Long-video export without the RAM cliff: decodes the video latent in "
+        "chunks (causal-context-exact) and streams frames directly into ffmpeg. "
+        "The full pixel tensor never exists — RAM use is constant at any length. "
+        "Feed decoded AUDIO to mux; audio decode is cheap and stays external."
+    )
+
+    def stream_save(self, latent, vae, chunk_latents, context_latents, fps,
+                    filename_prefix, crf, optional_audio=None):
+        import os
+        import shutil
+        import subprocess
+        import folder_paths
+
+        raw = latent["samples"]
+        if _HAS_NESTED and isinstance(raw, NestedTensor):
+            video = raw.tensors[0]
+        else:
+            video = raw
+        if video.ndim != 5:
+            raise ValueError(
+                f"[LTXAVStreamingSave] expected a 5D video latent, got {video.ndim}D."
+            )
+        video = video[:1]
+        T = video.shape[2]
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            try:
+                from imageio_ffmpeg import get_ffmpeg_exe
+                ffmpeg = get_ffmpeg_exe()
+            except Exception:
+                raise RuntimeError(
+                    "[LTXAVStreamingSave] ffmpeg not found on PATH (and "
+                    "imageio-ffmpeg unavailable)."
+                )
+
+        out_dir = folder_paths.get_output_directory()
+        full_folder, fname, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, out_dir
+        )
+        video_tmp  = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.mp4")
+        final_path = os.path.join(full_folder, f"{fname}_{counter:05}.mp4")
+
+        proc = None
+        frames_written = 0
+        try:
+            k = 0
+            while k < T:
+                model_management.throw_exception_if_processing_interrupted()
+                n = min(chunk_latents, T - k)
+                c = 0 if k == 0 else min(context_latents, k)
+                px = vae.decode(video[:, :, k - c : k + n])
+                if isinstance(px, tuple):
+                    px = px[0]
+                if px.ndim == 5:
+                    px = px.reshape(-1, *px.shape[-3:])
+                if k > 0:
+                    # keep exactly this chunk's 8*n frames; the discarded head
+                    # holds the context latents' pixels incl. the malformed
+                    # 1-px slice start.
+                    px = px[-(8 * n):]
+
+                if proc is None:
+                    H, W = int(px.shape[1]), int(px.shape[2])
+                    proc = subprocess.Popen(
+                        [ffmpeg, "-y", "-loglevel", "error",
+                         "-f", "rawvideo", "-pix_fmt", "rgb24",
+                         "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:",
+                         "-c:v", "libx264", "-preset", "medium",
+                         "-crf", str(crf), "-pix_fmt", "yuv420p",
+                         video_tmp],
+                        stdin=subprocess.PIPE,
+                    )
+
+                data = (
+                    px.clamp(0, 1).mul(255).round()
+                      .to(torch.uint8).cpu().contiguous().numpy().tobytes()
+                )
+                proc.stdin.write(data)
+                frames_written += px.shape[0]
+                print(f"[LTXAVStreamingSave] latents [{k},{k + n}) of {T} -> "
+                      f"{px.shape[0]} frames (total {frames_written})")
+                del px, data
+                k += n
+
+            proc.stdin.close()
+            ret = proc.wait()
+            if ret != 0:
+                raise RuntimeError(f"[LTXAVStreamingSave] ffmpeg exited with {ret}.")
+            proc = None
+        finally:
+            if proc is not None:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                proc.kill()
+
+        if optional_audio is not None and optional_audio.get("waveform") is not None:
+            import torchaudio
+            wav_tmp = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.wav")
+            wf = optional_audio["waveform"]
+            if wf.ndim == 3:
+                wf = wf[0]
+            torchaudio.save(wav_tmp, wf.cpu(), int(optional_audio["sample_rate"]))
+            mux = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error",
+                 "-i", video_tmp, "-i", wav_tmp,
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-shortest", final_path],
+            )
+            if mux.returncode != 0:
+                raise RuntimeError("[LTXAVStreamingSave] audio mux failed "
+                                   f"(ffmpeg exit {mux.returncode}); silent video "
+                                   f"kept at {video_tmp}")
+            os.remove(video_tmp)
+            os.remove(wav_tmp)
+        else:
+            os.replace(video_tmp, final_path)
+
+        print(f"[LTXAVStreamingSave] {frames_written} frames "
+              f"({frames_written / fps:.2f}s) -> {final_path}")
+        # Inline video preview (core SaveVideo convention). The player streams
+        # the file from disk via /view — previewing costs no RAM at any length.
+        return {
+            "ui": {
+                "images": [{
+                    "filename": os.path.basename(final_path),
+                    "subfolder": subfolder,
+                    "type": "output",
+                }],
+                "animated": (True,),
+            },
+            "result": (final_path,),
+        }
+
+
 NODE_CLASS_MAPPINGS = {
     "PreviewImagePassthrough":          PreviewImagePassthrough,
     "LTXAVLatentCheck":                 LTXAVLatentCheck,
@@ -538,6 +797,8 @@ NODE_CLASS_MAPPINGS = {
     "LTXVAVLatentUpsampler":            LTXVAVLatentUpsampler,
     "LTXVAVLatentUpsamplerTiled":       LTXVAVLatentUpsamplerTiled,
     "LTXKeyframePairConcat":            LTXKeyframePairConcat,
+    "LTXLoraMetadataReader":            LTXLoraMetadataReader,
+    "LTXAVStreamingSave":               LTXAVStreamingSave,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -548,4 +809,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXVAVLatentUpsampler":            "LTX AV Latent Upsampler",
     "LTXVAVLatentUpsamplerTiled":       "LTX AV Latent Upsampler (Tiled)",
     "LTXKeyframePairConcat":            "LTX Keyframe Pair Concat",
+    "LTXLoraMetadataReader":            "LTX LoRA Metadata Reader",
+    "LTXAVStreamingSave":               "LTX AV Streaming Decode & Save",
 }
