@@ -103,6 +103,20 @@ Long-video export without the RAM cliff: decodes the video latent in temporal ch
 
 **Output:** `file_path` (STRING). Note there is deliberately no IMAGE output — pixels stream out and are gone; anything needing frames works from the latent or the saved file.
 
+### LTX Streaming Video Encode
+The input-side mirror: encodes a video **file** to latents in temporal chunks — frames are read from disk one chunk at a time, so the full pixel tensor never exists and RAM is constant at any source length. Each chunk is encoded with `context_latents` of left pixel context (plus the 1-frame head) which are trimmed from the output; causal-exact, same trick as the decode side in reverse. Long-source v2v guides (pixel upscale, clean plate, control videos saved to disk) without the IMAGE-batch RAM cliff.
+
+| Input | Default | Description |
+|---|---|---|
+| `video_path` | — | Source file — wire from Video Cut Marker's `video_path` or type a path |
+| `width` / `height` | 0 | Resize before encode (0 = native), snapped ÷32. For small-grid IC guides set gen/factor here |
+| `chunk_latents` | 16 | Latent frames encoded per chunk (~chunk×8 pixel frames of RAM at a time) |
+| `context_latents` | 4 | Causal left-context per chunk, trimmed. Raise if an A/B vs full encode ever shows a boundary diff |
+| `force_rate` | 0 | Resample fps while reading (0 = native; 24→25 safe, VHS-style accumulator) |
+| `frame_load_cap` / `skip_first_frames` | 0 | Read window (cap 0 = all) |
+
+**Outputs:** `latent`, `num_latents`, `num_frames`. Sources ending mid-latent are trimmed to the valid `(T−1)×8+1` count with a console note. Preprocessed branches (DWPose/depth) save their video to disk first, then stream-encode the file.
+
 ---
 
 ### LTX Audio Latent Trim

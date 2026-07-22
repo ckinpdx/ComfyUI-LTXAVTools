@@ -3,6 +3,18 @@
 ## 1.1.0 — 2026-07-15
 
 ### Added
+- **LTX Streaming Video Encode** (2026-07-21/22, validated — long-latent
+  roundtrip with no stitches): chunked VAE encode straight from a video file,
+  the input mirror of the streaming save. Causal left-context per chunk
+  (trimmed, incl. the malformed 1-frame head latent) makes it exact; only
+  latents accumulate, RAM constant at any source length. Bookkeeping proven
+  0-diff against single-pass reference across chunk sizes / mid-latent tails /
+  short sources.
+- **Streaming Save diagnosability** (2026-07-21): ffmpeg stderr is now
+  captured (deadlock-safe via temp file) and included in every error, the
+  resolved ffmpeg path is logged, a mid-stream ffmpeg death reports its own
+  stderr instead of a bare BrokenPipeError, and `wav_tmp` is cleaned up on mux
+  failure.
 - **LTX AV Streaming Decode & Save** (2026-07-17/18, validated): chunked
   causal-exact VAE decode piped directly into ffmpeg — constant RAM at any
   video length; audio muxed from decoded AUDIO; inline player on finish.
