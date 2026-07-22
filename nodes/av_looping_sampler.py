@@ -273,6 +273,19 @@ class LTXVAVLoopingSampler:
                                "1 = normal dense reference (Ingredients, CrossView, "
                                "depth/pose).",
                 }),
+                "video_cond_strength": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Mirror of audio_cond_strength, for VIDEO. Holds the "
+                               "input latent's video content instead of generating "
+                               "freely. 0.0 = ignore input video (normal generation). "
+                               "1.0 = freeze video, generate only audio (V2A / foley — "
+                               "real footage in, sound out). 0.5-0.85 = v2v guided "
+                               "regeneration (follow motion/structure, restyle). Only "
+                               "meaningful when the input AV latent's video is non-zero "
+                               "(warns otherwise). For speech re-dub over frozen video "
+                               "also set v2a_cross_attn=False (Cross-Attention Toggle) "
+                               "or the guide lips corrupt generated audio.",
+                }),
             },
         }
 
@@ -479,10 +492,18 @@ class LTXVAVLoopingSampler:
     def _get_per_tile_value(self, lst, idx):
         return lst[min(idx, len(lst) - 1)]
 
-    def _parse_ints(self, s, default="0", total_size=None):
+    def _parse_ints(self, s, default="0", total_size=None, label="value"):
         if not s:
             s = default
-        vals = [int(x.strip()) for x in s.split(",")]
+        try:
+            vals = [int(x.strip()) for x in s.split(",")]
+        except ValueError:
+            raise ValueError(
+                f"[LTXVAVLoopingSampler] {label} could not be parsed as integers: "
+                f"{s[:80]!r}. It expects comma-separated frame indices (e.g. "
+                f"'0,120,248,-1'). This looks like prompt text or another string was "
+                f"wired into {label} — check the wiring."
+            )
         if total_size is not None:
             vals = [v + total_size if v < 0 else v for v in vals]
         return vals
@@ -584,6 +605,7 @@ class LTXVAVLoopingSampler:
         guiding_latents, guiding_strength,
         keyframes, kf_idx_str,
         audio_cond_strength=0.0,
+        video_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         guiding_downscale_factor=1,
@@ -599,6 +621,18 @@ class LTXVAVLoopingSampler:
         v_samples = video_tile_latent["samples"]
         video_init = {"samples": v_samples[:, :, :T_v].clone()}
 
+        # video_cond_strength: hold the seeded input video content (V2A/v2v).
+        # Set a base noise mask so the model conditions on the input instead of
+        # generating freely; I2V/keyframe/guide masks below override per-frame.
+        # Only when > 0 — default leaves the mask unset (full generation), so
+        # existing graphs are bit-identical.
+        if video_cond_strength > 0.0:
+            video_init["noise_mask"] = torch.full(
+                (video_init["samples"].shape[0], 1, T_v, 1, 1),
+                1.0 - video_cond_strength,
+                device=video_init["samples"].device, dtype=torch.float32,
+            )
+
         # I2V: encode image at frame 0
         if cond_images is not None and kf_idx_str:
             kf_indices = [int(x) for x in kf_idx_str.split(",") if x.strip()]
@@ -606,9 +640,11 @@ class LTXVAVLoopingSampler:
                 if idx == 0:
                     encoded = vae.encode(img.unsqueeze(0)[:, :, :, :3])
                     video_init["samples"][:, :, :encoded.shape[2]] = encoded
-                    mask = video_init.get("noise_mask") or torch.ones(
-                        (1, 1, T_v, 1, 1), device=video_init["samples"].device
-                    )
+                    mask = video_init.get("noise_mask")
+                    if mask is None:
+                        mask = torch.ones(
+                            (1, 1, T_v, 1, 1), device=video_init["samples"].device
+                        )
                     mask[:, :, :encoded.shape[2]] = 1.0 - cond_image_strength
                     video_init["noise_mask"] = mask
                 else:
@@ -707,6 +743,7 @@ class LTXVAVLoopingSampler:
         keyframes, kf_idx_str, cond_image_strength,
         chunk_index,
         audio_cond_strength=0.0,
+        video_cond_strength=0.0,
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         ref_audio_swap=None,
@@ -715,6 +752,21 @@ class LTXVAVLoopingSampler:
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
         positive, negative = _get_raw_conds(guider)
+
+        # Short-prior / short-accumulator guard: the video blend and overlap
+        # select assume the accumulator is at least temporal_overlap long. A
+        # continuation prior (or a very short first chunk) shorter than the
+        # overlap otherwise crashes in _linear_overlap_blend. Clamp the overlap
+        # for this chunk so it degrades gracefully; downstream math derives from
+        # temporal_overlap so clamping here keeps the chunk self-consistent.
+        acc_T = video_acc["samples"].shape[2]
+        if temporal_overlap > acc_T:
+            print(f"[LTXVAVLoopingSampler] chunk {chunk_index}: accumulator ({acc_T} "
+                  f"latents) shorter than temporal_overlap ({temporal_overlap}) — "
+                  f"clamping overlap to {acc_T} for this chunk. A continuation prior "
+                  f"should be >= temporal_overlap in latents (~2s at overlap 48) for "
+                  f"full continuity context.")
+            temporal_overlap = acc_T
 
         num_new_v = min(v_end, video_tile_latent["samples"].shape[2]) - v_start
         T_v_chunk = temporal_overlap + num_new_v
@@ -755,6 +807,18 @@ class LTXVAVLoopingSampler:
             chunk_v[:, :, temporal_overlap : temporal_overlap + avail_new] = \
                 v_full[:, :, n_acc : n_acc + avail_new]
         video_init = {"samples": chunk_v}
+
+        # video_cond_strength: hold the input video content in the NEW region
+        # (the overlap region is frozen separately by the overlap guide below).
+        # Only when > 0 — default leaves the mask unset (full generation), so
+        # existing graphs are bit-identical.
+        if video_cond_strength > 0.0:
+            v_mask = torch.full(
+                (B, 1, T_v_chunk, 1, 1), 1.0 - video_cond_strength,
+                device=dev, dtype=torch.float32,
+            )
+            v_mask[:, :, :temporal_overlap] = 1.0 - overlap_cond_strength
+            video_init["noise_mask"] = v_mask
 
         positive, negative, video_init = self._add_latent_guide(
             vae, positive, negative, video_init,
@@ -951,6 +1015,7 @@ class LTXVAVLoopingSampler:
         prior_v_frames=0, prior_a_frames=0,
         ref_bank=None,
         guiding_downscale_factor=1,
+        video_cond_strength=0.0,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         chunk_idx    = 0
@@ -1017,6 +1082,7 @@ class LTXVAVLoopingSampler:
                 guiding_downscale_factor=guiding_downscale_factor,
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
                 audio_cond_strength=audio_cond_strength,
+                video_cond_strength=video_cond_strength,
                 adain_factor=adain_factor,
                 phase2_sampler=phase2_sampler,
                 phase2_guider=phase2_guider,
@@ -1118,6 +1184,7 @@ class LTXVAVLoopingSampler:
         optional_prior_av_latent=None,
         optional_ref_audio_bank=None,
         guiding_downscale_factor=1.0,
+        video_cond_strength=0.0,
     ):
         # Accepts the FLOAT latent_downscale_factor output of LTX IC-LoRA
         # Loader Model Only (metadata-driven); integer factor internally.
@@ -1131,6 +1198,15 @@ class LTXVAVLoopingSampler:
 
         ltxav = self._get_ltxav_model(model)
         video_samples, audio_samples = self._split_av(samples, ltxav)
+
+        # Zeros guard: video_cond_strength holds the INPUT video content, so it
+        # only does something when that content exists. An all-zeros input (a
+        # normal from-noise gen with an empty latent) would be "held" as black.
+        if video_cond_strength > 0.0 and float(video_samples.abs().max()) < 1e-6:
+            print("[LTXVAVLoopingSampler] WARNING: video_cond_strength > 0 but the "
+                  "input video latent is all zeros — it will hold black frames. Feed "
+                  "a real video latent (V2A/v2v), or set video_cond_strength = 0 for "
+                  "normal generation.")
 
         # Prior AV latent (video continuation): prepend the existing content to the
         # working latent and seed the accumulator with it, so generation continues
@@ -1170,11 +1246,19 @@ class LTXVAVLoopingSampler:
         # per chunk unless scene_lengths provides per-chunk pixel-frame counts.
         scene_sizes = None
         if scene_lengths and scene_lengths.strip():
-            scene_sizes = [
-                max(1, int(round(float(x))) // time_scale)
-                for x in scene_lengths.replace(",", "|").split("|")
-                if x.strip()
-            ]
+            try:
+                scene_sizes = [
+                    max(1, int(round(float(x))) // time_scale)
+                    for x in scene_lengths.replace(",", "|").split("|")
+                    if x.strip()
+                ]
+            except ValueError:
+                raise ValueError(
+                    "[LTXVAVLoopingSampler] scene_lengths could not be parsed as "
+                    f"numbers: {scene_lengths[:80]!r}. It expects pipe/comma-separated "
+                    "pixel-frame counts (e.g. '128|128|96'). This looks like a prompt "
+                    "or another string was wired into scene_lengths — check the wiring."
+                )
         chunk_schedule = []
         pos = 0
         while pos < new_frames:
@@ -1196,26 +1280,57 @@ class LTXVAVLoopingSampler:
             f"new latents per chunk {chunk_schedule}"
         )
 
-        per_tile_seed_offsets_list = self._parse_ints(per_tile_seed_offsets, "0")
+        per_tile_seed_offsets_list = self._parse_ints(
+            per_tile_seed_offsets, "0", label="per_tile_seed_offsets")
 
         kf_indices = self._parse_ints(
             optional_cond_image_indices, "0",
             total_size=frames * time_scale - 7,
+            label="optional_cond_image_indices",
         )
         kf_per_tile = self._calculate_keyframe_per_tile_indices(
             kf_indices, chunk_schedule, overlap_v, time_scale
         )
 
         if optional_cond_images is not None:
-            optional_keyframes = (
-                comfy.utils.common_upscale(
-                    optional_cond_images.movedim(-1, 1),
-                    width * width_scale, height * height_scale,
-                    "bilinear", crop="center",
-                ).movedim(1, -1).clamp(0, 1)
-            )
+            kf_th = height * height_scale
+            kf_tw = width * width_scale
+            if (optional_cond_images.shape[1] == kf_th
+                    and optional_cond_images.shape[2] == kf_tw):
+                # Pre-sized upstream (the normal case): zero-copy passthrough.
+                # The resize below is a fallback only — skipping it avoids
+                # allocating and holding a duplicate full-res image batch for
+                # the whole run (the original stays alive in Comfy's execution
+                # cache either way; the duplicate was the avoidable cost).
+                optional_keyframes = optional_cond_images
+            else:
+                print(f"[LTXVAVLoopingSampler] cond_images are "
+                      f"{optional_cond_images.shape[2]}x{optional_cond_images.shape[1]} "
+                      f"but output is {kf_tw}x{kf_th} — resizing (fallback). "
+                      f"Pre-size upstream to skip this copy.")
+                optional_keyframes = (
+                    comfy.utils.common_upscale(
+                        optional_cond_images.movedim(-1, 1),
+                        kf_tw, kf_th,
+                        "bilinear", crop="center",
+                    ).movedim(1, -1).clamp(0, 1)
+                )
+            # Images pair with indices positionally (zip); the shorter list wins.
+            n_img = optional_cond_images.shape[0]
+            n_idx = len(kf_indices)
+            if n_img != n_idx:
+                dropped = ("indices" if n_idx > n_img else "images")
+                print(f"[LTXVAVLoopingSampler] WARNING: {n_idx} cond_image_indices but "
+                      f"{n_img} cond_images — only {min(n_idx, n_img)} keyframes placed, "
+                      f"extra {dropped} dropped. (Keyframe Planner's `count` output = "
+                      f"the number of images to supply.)")
         else:
             optional_keyframes = None
+            if optional_cond_image_indices and optional_cond_image_indices.strip() not in ("", "0"):
+                print(f"[LTXVAVLoopingSampler] WARNING: cond_image_indices set "
+                      f"({optional_cond_image_indices!r}) but no optional_cond_images "
+                      f"connected — indices ignored, generation is unconditioned. "
+                      f"Wire the image batch or clear the indices.")
 
         # Small-grid IC-LoRA reference validation (guiding_downscale_factor > 1)
         if guiding_downscale_factor > 1 and optional_guiding_latents is not None:
@@ -1337,6 +1452,7 @@ class LTXVAVLoopingSampler:
                     prior_a_frames=prior_a_frames,
                     ref_bank=optional_ref_audio_bank,
                     guiding_downscale_factor=guiding_downscale_factor,
+                    video_cond_strength=video_cond_strength,
                 )
 
                 # accumulate video with spatial weights
