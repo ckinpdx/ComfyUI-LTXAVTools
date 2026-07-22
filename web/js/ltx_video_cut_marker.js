@@ -64,6 +64,8 @@ app.registerExtension({
             let endLat = null;      // usable latent count when an end marker is set
             let detectedFps = null;
             let scheduleMismatch = false;   // stored schedule longer than loaded media
+            let loadedName = null;          // media the widget currently shows
+            let pendingReset = false;       // user picked NEW media -> clear cuts on load
 
             const fps = () => (fpsWidget?.value > 0 ? fpsWidget.value : 25.0);
             const duration = () => (isFinite(video.duration) ? video.duration : 0);
@@ -132,7 +134,20 @@ app.registerExtension({
             mkBtn("⏹ end", "Video ends at playhead (E) — schedule stops here; "
                           + "frame_count/frame_load_cap cover only up to this marker",
                   () => setEndAtPlayhead());
-            mkBtn("✕ del", "Delete selected marker (X / Del / right-click)", () => deleteSelected());
+            mkBtn("✕ del", "Delete selected marker (X / right-click)", () => deleteSelected());
+            const autoInput = document.createElement("input");
+            autoInput.type = "number";
+            autoInput.min = "0.5";
+            autoInput.step = "0.5";
+            autoInput.value = "12";
+            autoInput.title = "Auto-cut interval in seconds";
+            autoInput.style.cssText =
+                "width:44px;background:#222;color:#ddd;border:1px solid #555;" +
+                "border-radius:3px;font-family:monospace;font-size:11px;padding:2px 4px;";
+            bar.appendChild(autoInput);
+            mkBtn("⚡ auto", "Replace ALL cuts with one every N seconds "
+                          + "(snapped to the latent grid, stops at the end marker)",
+                  () => autoPlaceCuts());
             mkBtn("⧉ copy", "Copy scene_lengths string", () => {
                 navigator.clipboard?.writeText(scenesWidget.value || "");
             });
@@ -209,6 +224,7 @@ app.registerExtension({
                 );
                 video.src = url;
                 detectedFps = null;
+                loadedName = name;
                 video.load();
                 loadWaveform(url);
             }
@@ -217,6 +233,12 @@ app.registerExtension({
             if (videoWidget) {
                 videoWidget.callback = function (...args) {
                     const rr = prevVideoCb?.apply(this, args);
+                    // A combo change to a DIFFERENT file is a user decision to
+                    // work on new media: the old schedule is meaningless there,
+                    // so clear it once metadata arrives. (Workflow restore goes
+                    // through _cutMarkerReload, never through this callback, so
+                    // saved schedules still survive refresh.)
+                    if (videoWidget.value !== loadedName) pendingReset = true;
                     loadVideo();
                     return rr;
                 };
@@ -237,6 +259,7 @@ app.registerExtension({
                         }
                         videoWidget.value = name;
                     }
+                    pendingReset = true;   // fresh upload = fresh schedule
                     loadVideo();
                 } else {
                     console.error("[LTXVideoCutMarker] upload failed", resp.status);
@@ -386,6 +409,27 @@ app.registerExtension({
                 if (selected < 0) return;
                 cuts.splice(selected, 1);
                 selected = -1;
+                syncWidget();
+                draw();
+            }
+            function autoPlaceCuts() {
+                if (!duration()) return;
+                const iv = parseFloat(autoInput.value);
+                if (!(iv > 0)) return;
+                const newCuts = [];
+                let prevL = 0;
+                for (let t = iv; t < endTime(); t += iv) {
+                    const p = snapBoundary(timeToFrame(t));
+                    const L = boundaryLatent(p);
+                    if (L > prevL && L <= effLatents() - 1) {
+                        newCuts.push({ t: frameToTime(p) });
+                        prevL = L;
+                    }
+                }
+                cuts = newCuts;
+                selected = -1;
+                console.debug("[CutMarker] auto-placed", cuts.length,
+                              "cuts @", iv, "s");
                 syncWidget();
                 draw();
             }
@@ -610,6 +654,7 @@ app.registerExtension({
 
             // ---- keyboard -----------------------------------------------------
             root.addEventListener("keydown", (e) => {
+                if (e.target.tagName === "INPUT") return;   // typing in the auto box
                 const fine = e.altKey;
                 const handled = () => { e.preventDefault(); e.stopPropagation(); };
                 switch (e.key) {
@@ -628,7 +673,6 @@ app.registerExtension({
                     case "e": case "E":
                         setEndAtPlayhead(); handled(); break;
                     case "x": case "X":
-                    case "Delete": case "Backspace":
                         deleteSelected(); handled(); break;
                     case "Escape":
                         selected = -1; draw(); handled(); break;
@@ -687,7 +731,17 @@ app.registerExtension({
             }
 
             video.addEventListener("loadedmetadata", () => {
-                restoreFromWidget();
+                if (pendingReset) {
+                    pendingReset = false;
+                    cuts = [];
+                    endLat = null;
+                    selected = -1;
+                    scheduleMismatch = false;
+                    console.debug("[CutMarker] new media -> schedule reset");
+                    syncWidget();   // emits a single full-length scene
+                } else {
+                    restoreFromWidget();
+                }
                 updateReadout();
                 draw();
             });
