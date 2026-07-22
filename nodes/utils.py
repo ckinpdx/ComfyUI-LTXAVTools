@@ -687,6 +687,9 @@ class LTXAVStreamingSave:
                     "[LTXAVStreamingSave] ffmpeg not found on PATH (and "
                     "imageio-ffmpeg unavailable)."
                 )
+        # Logged so shadowed-PATH problems (conda/minimal builds without
+        # libx264) are visible in reports.
+        print(f"[LTXAVStreamingSave] using ffmpeg: {ffmpeg}")
 
         out_dir = folder_paths.get_output_directory()
         full_folder, fname, counter, subfolder, _ = folder_paths.get_save_image_path(
@@ -695,8 +698,24 @@ class LTXAVStreamingSave:
         video_tmp  = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.mp4")
         final_path = os.path.join(full_folder, f"{fname}_{counter:05}.mp4")
 
+        import tempfile
+
         proc = None
         frames_written = 0
+        # ffmpeg's stderr goes to a temp file, not a pipe: nothing reads the
+        # pipe during the (long) encode, so a chatty ffmpeg could fill it and
+        # deadlock. The file is read back only to build error messages.
+        err_file = tempfile.TemporaryFile()
+
+        def _err_tail():
+            try:
+                err_file.seek(0)
+                tail = err_file.read()[-2000:].decode("utf-8", "replace").strip()
+            except Exception:
+                tail = ""
+            return (f"\n--- ffmpeg stderr ---\n{tail}" if tail
+                    else " (ffmpeg printed no error output)")
+
         try:
             k = 0
             while k < T:
@@ -724,13 +743,29 @@ class LTXAVStreamingSave:
                          "-crf", str(crf), "-pix_fmt", "yuv420p",
                          video_tmp],
                         stdin=subprocess.PIPE,
+                        stderr=err_file,
                     )
 
                 data = (
                     px.clamp(0, 1).mul(255).round()
                       .to(torch.uint8).cpu().contiguous().numpy().tobytes()
                 )
-                proc.stdin.write(data)
+                try:
+                    proc.stdin.write(data)
+                except (BrokenPipeError, OSError):
+                    # ffmpeg died mid-stream (bad build, permissions, disk
+                    # full) — the pipe error is just the messenger; surface
+                    # ffmpeg's own words instead.
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                    ret = proc.wait()
+                    proc = None
+                    raise RuntimeError(
+                        f"[LTXAVStreamingSave] ffmpeg died mid-stream "
+                        f"(exit {ret}).{_err_tail()}"
+                    )
                 frames_written += px.shape[0]
                 print(f"[LTXAVStreamingSave] latents [{k},{k + n}) of {T} -> "
                       f"{px.shape[0]} frames (total {frames_written})")
@@ -740,7 +775,9 @@ class LTXAVStreamingSave:
             proc.stdin.close()
             ret = proc.wait()
             if ret != 0:
-                raise RuntimeError(f"[LTXAVStreamingSave] ffmpeg exited with {ret}.")
+                raise RuntimeError(
+                    f"[LTXAVStreamingSave] ffmpeg exited with {ret}.{_err_tail()}"
+                )
             proc = None
         finally:
             if proc is not None:
@@ -749,6 +786,7 @@ class LTXAVStreamingSave:
                 except Exception:
                     pass
                 proc.kill()
+            err_file.close()
 
         if optional_audio is not None and optional_audio.get("waveform") is not None:
             import torchaudio
@@ -757,18 +795,31 @@ class LTXAVStreamingSave:
             if wf.ndim == 3:
                 wf = wf[0]
             torchaudio.save(wav_tmp, wf.cpu(), int(optional_audio["sample_rate"]))
-            mux = subprocess.run(
-                [ffmpeg, "-y", "-loglevel", "error",
-                 "-i", video_tmp, "-i", wav_tmp,
-                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                 "-shortest", final_path],
-            )
-            if mux.returncode != 0:
-                raise RuntimeError("[LTXAVStreamingSave] audio mux failed "
-                                   f"(ffmpeg exit {mux.returncode}); silent video "
-                                   f"kept at {video_tmp}")
+            try:
+                mux = subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error",
+                     "-i", video_tmp, "-i", wav_tmp,
+                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                     "-shortest", final_path],
+                    stderr=subprocess.PIPE,
+                )
+                if mux.returncode != 0:
+                    tail = (mux.stderr[-2000:].decode("utf-8", "replace").strip()
+                            if mux.stderr else "")
+                    raise RuntimeError(
+                        "[LTXAVStreamingSave] audio mux failed "
+                        f"(ffmpeg exit {mux.returncode}); silent video "
+                        f"kept at {video_tmp}"
+                        + (f"\n--- ffmpeg stderr ---\n{tail}" if tail else "")
+                    )
+            finally:
+                # wav_tmp is intermediate either way; video_tmp survives a mux
+                # failure on purpose (it's the user's silent fallback).
+                try:
+                    os.remove(wav_tmp)
+                except OSError:
+                    pass
             os.remove(video_tmp)
-            os.remove(wav_tmp)
         else:
             os.replace(video_tmp, final_path)
 
@@ -789,6 +840,221 @@ class LTXAVStreamingSave:
         }
 
 
+class LTXStreamingVideoEncode:
+    """
+    Chunked VAE encode straight from a video file — the full pixel tensor
+    never exists. Constant RAM at any source length: frames are read from
+    disk one chunk at a time, encoded with left pixel context, and only the
+    (tiny) latents accumulate.
+
+    Mirror of LTXAVStreamingSave's causal math: each chunk is encoded with
+    `context_latents` of left context plus the 1-frame head pixel, and the
+    context's latents (including the malformed 1-frame head latent) are
+    trimmed from the output — the same trick that makes chunked decode
+    exact, applied in reverse. Validate once per setup: encode a short clip
+    both ways and compare (LTX AV Latent Check) before trusting long runs.
+
+    Encodes FILES (e.g. Video Cut Marker's video_path). Branches that need
+    in-graph preprocessing (DWPose/depth) should save the preprocessed video
+    to disk first, then stream-encode that file.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Path to the source video file (wire from Video "
+                               "Cut Marker's video_path or type directly).",
+                }),
+                "vae": ("VAE",),
+                "width": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 32,
+                    "tooltip": "Resize width before encoding (0 = native). "
+                               "Snapped to ÷32. For small-grid IC guides use "
+                               "gen/factor here.",
+                }),
+                "height": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 32,
+                    "tooltip": "Resize height before encoding (0 = native, "
+                               "snapped ÷32).",
+                }),
+                "chunk_latents": ("INT", {
+                    "default": 16, "min": 2, "max": 256,
+                    "tooltip": "Latent frames encoded per chunk (~ chunk*8 "
+                               "pixel frames of RAM at a time).",
+                }),
+                "context_latents": ("INT", {
+                    "default": 4, "min": 1, "max": 16,
+                    "tooltip": "Left-context latents re-encoded with each chunk "
+                               "and trimmed. Must cover the causal VAE encoder's "
+                               "temporal receptive field; raise if the A/B "
+                               "against a full encode ever shows a boundary "
+                               "difference.",
+                }),
+                "force_rate": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 120.0, "step": 0.01,
+                    "tooltip": "Resample to this fps while reading (0 = native "
+                               "rate). Same accumulator scheme as VHS (24→25 "
+                               "safe).",
+                }),
+                "frame_load_cap": ("INT", {
+                    "default": 0, "min": 0, "max": 1_000_000,
+                    "tooltip": "Max pixel frames to read after rate/skip "
+                               "(0 = all). Wire from Video Cut Marker's "
+                               "frame_load_cap.",
+                }),
+                "skip_first_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 1_000_000,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("latent", "num_latents", "num_frames")
+    FUNCTION     = "encode"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Long-source encode without the RAM cliff: reads a video file in "
+        "chunks and VAE-encodes each with causal left context, so only the "
+        "latents accumulate — the full pixel tensor never exists. The input "
+        "mirror of LTX AV Streaming Decode & Save."
+    )
+
+    def _frame_gen(self, path, force_rate, skip, cap_frames):
+        import cv2
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise ValueError(f"[LTXStreamingVideoEncode] could not open: {path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        base_t   = (1.0 / fps) if fps > 0 else 0.0
+        target_t = (1.0 / force_rate) if force_rate > 0 else base_t
+        time_acc = 0.0
+        yielded = skipped = 0
+        try:
+            while True:
+                if not cap.grab():
+                    break
+                if force_rate > 0 and fps > 0:
+                    time_acc += base_t
+                    if time_acc < target_t:
+                        continue
+                    time_acc -= target_t
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
+                if skipped < skip:
+                    skipped += 1
+                    continue
+                yield frame  # BGR uint8 HWC
+                yielded += 1
+                if cap_frames and yielded >= cap_frames:
+                    break
+        finally:
+            cap.release()
+
+    def encode(self, video_path, vae, width, height, chunk_latents,
+               context_latents, force_rate, frame_load_cap, skip_first_frames):
+        import itertools
+        import comfy.utils
+
+        video_path = video_path.strip().strip('"')
+        if not video_path or not os.path.isfile(video_path):
+            raise ValueError(
+                f"[LTXStreamingVideoEncode] video_path is not a file: "
+                f"{video_path!r}"
+            )
+
+        gen = self._frame_gen(video_path, force_rate, skip_first_frames,
+                              frame_load_cap)
+
+        def take(n):
+            return list(itertools.islice(gen, n))
+
+        def to_tensor(frames):
+            # BGR uint8 -> RGB float [T,H,W,C], resized to target dims
+            arr = np.stack(frames)[..., ::-1]
+            t = torch.from_numpy(np.ascontiguousarray(arr)).float() / 255.0
+            if t.shape[1] != th or t.shape[2] != tw:
+                t = comfy.utils.common_upscale(
+                    t.movedim(-1, 1), tw, th, "lanczos", crop="center",
+                ).movedim(1, -1).clamp(0, 1)
+            return t
+
+        # First chunk: n0 latents need 8*(n0-1)+1 pixel frames.
+        first = take(8 * (chunk_latents - 1) + 1)
+        if not first:
+            raise ValueError(
+                "[LTXStreamingVideoEncode] no frames read (empty video, or "
+                "skip_first_frames past the end)."
+            )
+        # target dims: explicit, else native snapped to /32
+        H0, W0 = first[0].shape[0], first[0].shape[1]
+        th = height if height > 0 else max(32, int(round(H0 / 32)) * 32)
+        tw = width  if width  > 0 else max(32, int(round(W0 / 32)) * 32)
+        th, tw = max(32, (th // 32) * 32), max(32, (tw // 32) * 32)
+        if (th, tw) != (H0, W0):
+            print(f"[LTXStreamingVideoEncode] resizing {W0}x{H0} -> {tw}x{th}")
+
+        drop = (len(first) - 1) % 8
+        if drop:
+            # short video: keep the valid (T-1)*8+1 head, note the trim
+            print(f"[LTXStreamingVideoEncode] source ended mid-latent — "
+                  f"dropping {drop} tail frame(s).")
+            first = first[:len(first) - drop]
+
+        chunks = []
+        frames_read = len(first)
+        window = to_tensor(first)
+        del first
+        lat = vae.encode(window)
+        chunks.append(lat.cpu())
+        total_latents = lat.shape[2]
+        print(f"[LTXStreamingVideoEncode] frames [0,{frames_read}) -> "
+              f"latents [0,{total_latents})")
+
+        tail_len = 8 * context_latents + 1
+        while True:
+            model_management.throw_exception_if_processing_interrupted()
+            new = take(8 * chunk_latents)
+            if not new:
+                break
+            rem = len(new) % 8
+            if rem:
+                print(f"[LTXStreamingVideoEncode] source ended mid-latent — "
+                      f"dropping {rem} tail frame(s).")
+                new = new[:len(new) - rem]
+                if not new:
+                    break
+            n = len(new) // 8
+            # window = aligned suffix of the previous window (length ≡ 1 mod 8:
+            # context latents' pixels + the 1-frame head) + the new frames. The
+            # head latent and context latents are trimmed from the encode.
+            avail = 8 * min(context_latents, (window.shape[0] - 1) // 8) + 1
+            window = torch.cat([window[-avail:], to_tensor(new)], dim=0)
+            start_f = frames_read
+            frames_read += 8 * n
+            del new
+            lat = vae.encode(window)
+            if lat.shape[2] < n:
+                raise RuntimeError(
+                    f"[LTXStreamingVideoEncode] encoder returned {lat.shape[2]} "
+                    f"latents for a window expecting >= {n} — unexpected VAE "
+                    f"temporal mapping."
+                )
+            chunks.append(lat[:, :, -n:].cpu())
+            total_latents += n
+            print(f"[LTXStreamingVideoEncode] frames [{start_f},{frames_read}) "
+                  f"-> latents [{total_latents - n},{total_latents})")
+
+        del window
+        latent = torch.cat(chunks, dim=2) if len(chunks) > 1 else chunks[0]
+        print(f"[LTXStreamingVideoEncode] done: {frames_read} frames -> "
+              f"{latent.shape[2]} latents ({tw}x{th}).")
+        return ({"samples": latent}, int(latent.shape[2]), int(frames_read))
+
+
 NODE_CLASS_MAPPINGS = {
     "PreviewImagePassthrough":          PreviewImagePassthrough,
     "LTXAVLatentCheck":                 LTXAVLatentCheck,
@@ -799,6 +1065,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXKeyframePairConcat":            LTXKeyframePairConcat,
     "LTXLoraMetadataReader":            LTXLoraMetadataReader,
     "LTXAVStreamingSave":               LTXAVStreamingSave,
+    "LTXStreamingVideoEncode":          LTXStreamingVideoEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -811,4 +1078,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXKeyframePairConcat":            "LTX Keyframe Pair Concat",
     "LTXLoraMetadataReader":            "LTX LoRA Metadata Reader",
     "LTXAVStreamingSave":               "LTX AV Streaming Decode & Save",
+    "LTXStreamingVideoEncode":          "LTX Streaming Video Encode",
 }
