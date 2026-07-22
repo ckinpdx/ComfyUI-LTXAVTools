@@ -208,18 +208,57 @@ class LTXDimensionCalculator3Stage:
                     "default": default,
                     "tooltip": "All options are divisible by 128.",
                 }),
-            }
+            },
+            "optional": {
+                "use_custom": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Override the dropdown with custom_width/custom_height. "
+                               "Toggle-controlled (not value-based), so a bypassed upstream "
+                               "node can't accidentally switch modes.",
+                }),
+                "custom_role": (["quarter (stage 1)", "half (stage 2)", "full (final)"], {
+                    "default": "quarter (stage 1)",
+                    "tooltip": "Which stage the custom size describes. 'quarter (stage 1)' "
+                               "sets full = 4x custom (input-video case: stage 1 matches "
+                               "the source). 'half (stage 2)' sets full = 2x custom. "
+                               "'full (final)' derives the halves down from custom.",
+                }),
+                "custom_width": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Custom width — used only when use_custom is on. Snapped to "
+                               "the role's grid (÷32 quarter, ÷64 half, ÷128 full) so every "
+                               "derived stage stays LTX-valid.",
+                }),
+                "custom_height": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Custom height — used only when use_custom is on.",
+                }),
+            },
         }
 
     @classmethod
-    def VALIDATE_INPUTS(cls, ratio, orientation, resolution):
+    def VALIDATE_INPUTS(cls, **kwargs):
         return True
 
     RETURN_TYPES  = ("INT", "INT", "INT", "INT", "INT", "INT", "STRING")
     RETURN_NAMES  = ("width", "height", "width_half", "height_half", "width_quarter", "height_quarter", "label")
     FUNCTION      = "calculate"
 
-    def calculate(self, ratio: str, orientation: str, resolution: str):
+    def calculate(self, ratio: str, orientation: str, resolution: str,
+                  use_custom: bool = False, custom_role: str = "quarter (stage 1)",
+                  custom_width: int = 0, custom_height: int = 0):
+        if use_custom:
+            role = str(custom_role)
+            grid = 32 if role.startswith("quarter") else (64 if role.startswith("half") else 128)
+            cw = _snap(custom_width, grid)
+            ch = _snap(custom_height, grid)
+            if cw > 0 and ch > 0:
+                mult = 4 if role.startswith("quarter") else (2 if role.startswith("half") else 1)
+                fw, fh = cw * mult, ch * mult
+                label = f"{fw // 4}x{fh // 4} -> {fw // 2}x{fh // 2} -> {fw}x{fh}"
+                return (fw, fh, fw // 2, fh // 2, fw // 4, fh // 4, label)
+            print("[LTXDimensionCalculator3Stage] use_custom on but custom dims <= 0 "
+                  "(upstream bypassed?); falling back to the dropdown.")
         w, h = map(int, resolution.split("x"))
         return (w, h, w // 2, h // 2, w // 4, h // 4, resolution)
 
