@@ -115,7 +115,7 @@ The input-side mirror: encodes a video **file** to latents in temporal chunks �
 | `width` / `height` | 0 | Resize before encode (0 = native), snapped ÷32. For small-grid IC guides set gen/factor here |
 | `chunk_latents` | 16 | Latent frames encoded per chunk (~chunk×8 pixel frames of RAM at a time) |
 | `context_latents` | 4 | Causal left-context per chunk, trimmed. Raise if an A/B vs full encode ever shows a boundary diff |
-| `force_rate` | 0 | Resample fps while reading (0 = native; 24→25 safe, VHS-style accumulator) |
+| `force_rate` | 0 | Resample fps while reading (0 = native). **Set this to your emit/consume rate (25), the same as the VHS loader** — the resampler duplicates (upsample) or drops (downsample) frames so its output-frame indices match VHS's stream, which is what lets the Cut Marker's `skip_first_frames` / `frame_load_cap` land on the same content in both. Mismatched rates offset the encode start. |
 | `frame_load_cap` / `skip_first_frames` | 0 | Read window (cap 0 = all) |
 
 **Outputs:** `latent`, `num_latents`, `num_frames`. Sources ending mid-latent are trimmed to the valid `(T−1)×8+1` count with a console note. Preprocessed branches (DWPose/depth) save their video to disk first, then stream-encode the file.

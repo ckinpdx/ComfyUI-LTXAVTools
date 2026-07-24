@@ -74,6 +74,17 @@
   chunked long-form pixel upscaling. Factor 1 = unchanged dense references.
 
 ### Fixed
+- **Streaming Video Encode: frame resampler now duplicates as well as drops**
+  (2026-07-24): the old accumulator only decimated (force_rate < native), so
+  for the upsample case (24 → 25) it passed native frames through 1:1 and
+  `skip_first_frames` / `frame_load_cap` — emitted by the Cut Marker in
+  emit_fps (25) space — were applied at the native rate, landing the encode
+  ~`skip × (1/native − 1/out)` seconds late (e.g. skip 3401 started at 141.7s
+  instead of 136.0s). Replaced with a drift-free nearest/hold index map
+  (`out frame j ← native floor(j·native/out)`) that duplicates on upsample and
+  drops on downsample, matching the VHS force_rate stream so the same indices
+  hit the same content across the loader and the encode. Requires the encode's
+  `force_rate` set to the emit/consume rate (25), same as VHS.
 - **Conditioning sanitizer — stale guide bookkeeping stripped on entry**
   (2026-07-22): the sampler now removes any `keyframe_idxs` /
   `guide_attention_entries` from incoming conditioning (it builds its own
