@@ -3,6 +3,16 @@
 ## 1.1.0 — 2026-07-15
 
 ### Added
+- **LTX Video Outpaint Latent** (2026-07-24, validated): latent-space outpaint
+  prep for the base-model path — zero-pads an encoded video latent (real
+  centre, **zero margin**) + emits a feathered denoise mask. The zero margin
+  regenerates cleanly because it is empty; padding *pixels* (black/grey/green)
+  bakes structured content the model preserves — that's why pixel-padded
+  outpaint left borders. No LoRA, no fill color. `overlap` (full-regen band
+  straddling the seam) + `feather` (ramp into the kept interior) are
+  independent seam knobs; `margin_fill` zeros (default) or noise. Run in a
+  full-denoise pass. Fixes the black-artifact failure, not the
+  one-sided-context limit (moving-camera / simple margins strongest).
 - **Video Cut Marker: start marker** (2026-07-22, confirmed): blue `S` marker
   trims the head; new `skip_first_frames` output (appended) wires to the VHS
   loader so generation begins there. The schedule is measured across the

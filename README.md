@@ -135,6 +135,19 @@ Composites a solid fill color where the mask is active — inpaint-guide prep fo
 
 **Output:** `image`. Only needed for the IC-LoRA inpaint route; base-model inpainting uses `optional_denoise_mask` alone (no color fill).
 
+### LTX Video Outpaint Latent
+Latent-space **outpaint** prep for the base-model path (no LoRA, no fill color). Zero-pads an encoded video latent — real content in the centre, **zeros in the margin** — and emits the matching feathered denoise mask. The zero margin is *why it works where padding pixels fails*: encoding padded pixels (black / grey / green) bakes **structured content** the model reads as "stuff is here" and tries to preserve, whereas a zero margin is an empty generation target — the same substrate a from-scratch generation starts from. Run in a **full-denoise pass** so the sampler noises and regenerates the margin (a low-denoise refinement won't add enough noise to a bare margin).
+
+| Input | Default | Description |
+|---|---|---|
+| `samples` | — | Encoded **video** latent (5D `[B,C,T,H,W]`) — not an AV NestedTensor. Separate video, outpaint, re-concat audio |
+| `left` / `top` / `right` / `bottom` | 0 | Per-edge padding in pixels, snapped to the LTX spatial grid (÷32) |
+| `overlap` | 0 | Full-regenerate band (px) of the original at the seam — rewritten so the seam sits inside one continuous generation, not on a partial-keep line. Keep small (~16–32) |
+| `feather` | 32 | Mask ramp (px) beyond the overlap, regen→keep, into the original |
+| `margin_fill` | zeros | `zeros` (correct — the sampler noises it) or `noise` (pre-populate for low-denoise passes, experimental) |
+
+**Outputs:** `latent` (zero-padded video), `denoise_mask` (feathered). Wire `latent` (after `LTXVConcatAVLatent` with your audio) → sampler `latents`, and `denoise_mask` → `optional_denoise_mask`. Prompt describes the extended scene (no LoRA prior). Fixes the black-artifact failure, not the one-sided-context limit — strongest on moving-camera / simple margins; large static extensions are where the outpaint IC-LoRA (Inpaint Color Fill + guide) still has a role.
+
 ### LTX Audio Latent Trim
 Trims a 4D audio latent `[B, C, T, F]` along the temporal axis. Supports negative indexing. Used to extract context and output windows in sliding-window loops.
 

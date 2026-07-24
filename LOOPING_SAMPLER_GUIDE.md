@@ -225,15 +225,41 @@ N% kept` — sanity-check it against what you painted (≈0% kept = inverted pol
 **Boundary artifacts:** if halos appear where kept meets regenerated, feather the mask
 (soft grey falloff) — fractional values interpolate through the same merge math.
 
+### Outpaint (extend the frame) — `LTX Video Outpaint Latent`
+
+Outpaint is inpaint where the "hole" is the added margin, but with a crucial difference:
+**do it in latent space, not pixel space.** Padding the *pixels* (black, grey, or even the
+LoRA's green) and encoding bakes *structured content* the model reads as "stuff is here"
+and tries to preserve — that's why pixel-padded outpaint leaves borders and won't extend.
+`LTX Video Outpaint Latent` instead zero-pads the encoded video latent (real centre, **zero
+margin**) and emits the feathered mask. A zero margin is nothing to preserve — the same
+empty target a from-scratch generation starts from — so under mask=1 the sampler noises and
+regenerates it cleanly. **No LoRA, no fill color, no green rim.**
+
+- **Run in a full-denoise pass** (stage 1). The margin only regenerates because the sampler
+  noises it to the schedule's starting level; a low-denoise refinement won't. Stage 2 then
+  refines what stage 1 generated.
+- **`overlap` + `feather` at the seam:** `overlap` fully regenerates a thin strip of the
+  original *and* the margin as one continuous zone (so the seam isn't a partial-keep line
+  that ghosts the old edge); `feather` ramps that regeneration into the kept interior.
+  Independent knobs — overlap fixes the seam, feather fixes the blend behind it.
+- **The prompt carries the margin** — no trained "extend the scene" prior, so describe what
+  belongs in the new space.
+- Fixes the black-artifact failure, **not** the one-sided-context limit: strongest on
+  moving-camera shots (motion feeds the margin over time) and simple margins (sky, wall,
+  bokeh); large static extensions run out of context at the frame edge — LoRA territory.
+
 ### When the IC-LoRA route still wins (the fallback)
 
 Reach for **LTX Inpaint Color Fill** + an inpaint IC-LoRA (guide + `guiding_downscale_factor`
-from metadata, §7) for the cases the base model struggles with: **large holes** where most
-of the region must be hallucinated from little surrounding context, and **hard semantic
-edits** the base model resists. Color Fill paints the masked region the LoRA's trained
-color (magenta / chroma green / Lightricks green) — composite at final resolution so the
-boundary stays exact. For ordinary object removal, face swaps, and localized changes,
-base + mask is simpler and sufficient.
+from metadata, §7) for the cases the base model struggles with: **large holes / extensions**
+where most of the region must be hallucinated from little surrounding context, and **hard
+semantic edits** the base model resists. Color Fill paints the masked region the LoRA's
+trained color (magenta / chroma green / Lightricks green) — composite at final resolution so
+the boundary stays exact, and match the color to the LoRA *exactly* (an off-shade or a
+feather-blended impure fill isn't recognized as "fill here" and survives as a border). For
+ordinary object removal, face swaps, localized changes, and modest outpaint, base + mask is
+simpler and sufficient.
 
 ---
 
