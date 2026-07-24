@@ -20,13 +20,16 @@ const CUT_COLOR     = "#4caf50";
 const CUT_SELECTED  = "#a5d6a7";
 const END_COLOR     = "#ef5350";
 const END_SELECTED  = "#ff8a80";
+const START_COLOR   = "#42a5f5";
+const START_SELECTED = "#90caf9";
 const DEAD_REGION   = "rgba(0,0,0,0.55)";
 const SCENE_LABEL   = "#777";
 const PLAYHEAD      = "#e0e0e0";
 const BAR_BG        = "#1c1c1c";
 const WAVEFORM      = "#2e4b40";
 
-const END_SEL = -2;   // `selected` sentinel for the end marker
+const END_SEL   = -2;   // `selected` sentinel for the end marker
+const START_SEL = -3;   // `selected` sentinel for the start marker
 
 function frameToLatent(f) {
     return f <= 0 ? 0 : Math.floor((f - 1) / 8) + 1;
@@ -56,12 +59,14 @@ app.registerExtension({
             const videoWidget  = node.widgets.find((w) => w.name === "video");
             const scenesWidget = node.widgets.find((w) => w.name === "scene_lengths");
             const fpsWidget    = node.widgets.find((w) => w.name === "emit_fps");
+            const startWidget  = node.widgets.find((w) => w.name === "start_frame");
 
             // ---- state -----------------------------------------------------
             // cuts: [{ t: seconds }] — each marks the start of the next scene.
             let cuts = [];
-            let selected = -1;      // cut index, or END_SEL for the end marker
+            let selected = -1;      // cut index, or END_SEL / START_SEL marker
             let endLat = null;      // usable latent count when an end marker is set
+            let startLat = 0;       // first generated latent (0 = start of video)
             let detectedFps = null;
             let scheduleMismatch = false;   // stored schedule longer than loaded media
             let loadedName = null;          // media the widget currently shows
@@ -82,9 +87,18 @@ app.registerExtension({
             // End marker sits on the LAST pixel of latent E: frame 8(E-1).
             const endFrame = () => 8 * (effLatents() - 1);
             const endTime  = () => frameToTime(endFrame());
+            // Start marker sits on the FIRST pixel of latent startLat: 1+8(L-1)
+            // (== skip_first_frames). 0 = no trim.
+            const startFramePos = () => (startLat <= 0 ? 0 : 1 + 8 * (startLat - 1));
+            const startTime = () => frameToTime(startFramePos());
             const lastBoundaryLat = () => {
-                let m = 0;
+                let m = startLat;
                 for (const c of cuts) m = Math.max(m, boundaryLatent(snapBoundary(timeToFrame(c.t))));
+                return m;
+            };
+            const firstCutLat = () => {
+                let m = effLatents();
+                for (const c of cuts) m = Math.min(m, boundaryLatent(snapBoundary(timeToFrame(c.t))));
                 return m;
             };
 
@@ -131,6 +145,9 @@ app.registerExtension({
             mkBtn("+1", "Forward one frame (Alt+→)", () => stepPlayhead(1));
             mkBtn("+8", "Forward one latent (→)", () => stepPlayhead(8));
             mkBtn("✂ cut", "New scene starts at playhead (C)", () => addCutAtPlayhead());
+            mkBtn("⏭ start", "Generation STARTS at playhead (S) — trims the head; "
+                          + "emits skip_first_frames so the loader begins here",
+                  () => setStartAtPlayhead());
             mkBtn("⏹ end", "Video ends at playhead (E) — schedule stops here; "
                           + "frame_count/frame_load_cap cover only up to this marker",
                   () => setEndAtPlayhead());
@@ -318,39 +335,47 @@ app.registerExtension({
             function boundaryLatents() {
                 const ls = cuts.map((c) => boundaryLatent(snapBoundary(timeToFrame(c.t))));
                 return [...new Set(ls)].sort((a, b) => a - b)
-                    .filter((L) => L >= 1 && L <= effLatents() - 1);
+                    .filter((L) => L > startLat && L <= effLatents() - 1);
             }
             function syncWidget() {
                 if (!duration()) return;
                 scheduleMismatch = false;   // an explicit (re-)emit supersedes the warning
                 const Ls = boundaryLatents();
                 const lengths = [];
-                let prev = 0;
+                let prev = startLat;   // schedule measured FROM the start marker
                 for (const L of Ls) { lengths.push((L - prev) * 8); prev = L; }
                 lengths.push((effLatents() - prev) * 8);   // final scene to end marker/video end
                 scenesWidget.value = lengths.join("|");
+                if (startWidget) startWidget.value = startFramePos();
                 console.debug("[CutMarker] sync:", JSON.stringify(scenesWidget.value),
-                              "endLat =", endLat,
+                              "startLat =", startLat, "endLat =", endLat,
                               "cuts[] =", cuts.map((c) => c.t.toFixed(3)).join(" "));
             }
             function restoreFromWidget() {
                 console.debug("[CutMarker] RESTORE from:", JSON.stringify(scenesWidget.value),
                               "duration =", duration());
                 if (!duration()) return;
+                // Start marker restores from its own widget (the schedule is
+                // measured relative to it and can't encode it).
+                const sf = startWidget ? Math.max(0, Math.round(startWidget.value || 0)) : 0;
+                startLat = sf <= 0 ? 0 : boundaryLatent(sf);
+                if (startLat >= totalLatents()) startLat = 0;   // stale/oversized -> ignore
                 const toks = (scenesWidget.value || "").replace(/,/g, "|").split("|")
                     .map((s) => s.trim()).filter(Boolean);
                 const latents = toks.map((s) => Math.round((parseInt(s, 10) || 0) / 8))
                     .filter((n) => n > 0);
-                // A schedule summing short of the video's length implies an end marker.
+                // Schedule covers [startLat, genEnd). A genEnd short of the video
+                // implies an end marker; over it implies wrong media loaded.
                 const total = latents.reduce((a, b) => a + b, 0);
-                scheduleMismatch = total > totalLatents();
-                endLat = (total >= 1 && total < totalLatents()) ? total : null;
+                const genEnd = startLat + total;
+                scheduleMismatch = genEnd > totalLatents();
+                endLat = (total >= 1 && genEnd < totalLatents()) ? genEnd : null;
                 cuts = [];
-                let cum = 0;
+                let cum = startLat;
                 // all entries except the last define a boundary after them
                 for (let i = 0; i < latents.length - 1; i++) {
                     cum += latents[i];
-                    if (cum >= 1 && cum <= effLatents() - 1) {
+                    if (cum > startLat && cum <= effLatents() - 1) {
                         cuts.push({ t: frameToTime(1 + 8 * (cum - 1)) });
                     }
                 }
@@ -391,16 +416,36 @@ app.registerExtension({
                 if (!duration()) return;
                 const f = timeToFrame(video.currentTime);
                 let E = Math.round(f / 8) + 1;   // end sits on last px of latent E: 8(E-1)
-                E = Math.max(lastBoundaryLat() + 1, Math.min(totalLatents(), E));
+                E = Math.max(lastBoundaryLat() + 1, startLat + 1, Math.min(totalLatents(), E));
                 endLat = E;
                 selected = END_SEL;
                 seekFrame(endFrame());
                 syncWidget();
                 draw();
             }
+            function setStartAtPlayhead() {
+                if (!duration()) return;
+                const p = snapBoundary(timeToFrame(video.currentTime));
+                let L = boundaryLatent(p);
+                // Start must stay left of the first cut and the end marker.
+                L = Math.max(1, Math.min(firstCutLat() - 1, effLatents() - 1, L));
+                if (L < 1) return;
+                startLat = L;
+                selected = START_SEL;
+                seekFrame(startFramePos());
+                syncWidget();
+                draw();
+            }
             function deleteSelected() {
                 if (selected === END_SEL) {
                     endLat = null;
+                    selected = -1;
+                    syncWidget();
+                    draw();
+                    return;
+                }
+                if (selected === START_SEL) {
+                    startLat = 0;
                     selected = -1;
                     syncWidget();
                     draw();
@@ -417,8 +462,8 @@ app.registerExtension({
                 const iv = parseFloat(autoInput.value);
                 if (!(iv > 0)) return;
                 const newCuts = [];
-                let prevL = 0;
-                for (let t = iv; t < endTime(); t += iv) {
+                let prevL = startLat;
+                for (let t = startTime() + iv; t < endTime(); t += iv) {
                     const p = snapBoundary(timeToFrame(t));
                     const L = boundaryLatent(p);
                     if (L > prevL && L <= effLatents() - 1) {
@@ -436,10 +481,19 @@ app.registerExtension({
             function nudgeSelected(dir) {
                 if (selected === END_SEL) {
                     if (endLat === null) return;
-                    endLat = Math.max(lastBoundaryLat() + 1,
+                    endLat = Math.max(lastBoundaryLat() + 1, startLat + 1,
                                       Math.min(totalLatents(), endLat + dir));
                     if (endLat >= totalLatents()) endLat = totalLatents();
                     seekFrame(endFrame());
+                    syncWidget();
+                    draw();
+                    return;
+                }
+                if (selected === START_SEL) {
+                    if (startLat <= 0 && dir < 0) return;
+                    startLat = Math.max(0, Math.min(firstCutLat() - 1, effLatents() - 1,
+                                                    startLat + dir));
+                    seekFrame(startFramePos());
                     syncWidget();
                     draw();
                     return;
@@ -517,14 +571,27 @@ app.registerExtension({
                 }
                 ctx.stroke();
 
-                // scene index labels at region midpoints (up to end marker)
+                // scene index labels at region midpoints ([start, end] window)
                 const sceneEnd = endLat !== null ? endTime() : duration();
-                const bounds = [0, ...cuts.map((c) => c.t), sceneEnd];
+                const bounds = [startTime(), ...cuts.map((c) => c.t), sceneEnd];
                 ctx.fillStyle = SCENE_LABEL;
                 ctx.font = `${10 * (window.devicePixelRatio || 1)}px monospace`;
                 for (let i = 0; i < bounds.length - 1; i++) {
                     const mid = (bounds[i] + bounds[i + 1]) / 2;
                     ctx.fillText(`#${i}`, xForTime(mid) - 6, H * 0.3);
+                }
+
+                // dead region before the start marker
+                if (startLat > 0) {
+                    const xs = xForTime(startTime());
+                    ctx.fillStyle = DEAD_REGION;
+                    ctx.fillRect(0, 0, xs, H);
+                    ctx.strokeStyle = selected === START_SEL ? START_SELECTED : START_COLOR;
+                    ctx.lineWidth = selected === START_SEL ? 3 : 2;
+                    ctx.beginPath();
+                    ctx.moveTo(xs, 0); ctx.lineTo(xs, H);
+                    ctx.stroke();
+                    ctx.lineWidth = 1;
                 }
 
                 // dead region beyond the end marker
@@ -563,8 +630,9 @@ app.registerExtension({
             let dragging = -1;
             function cutAtX(x) {
                 const tol = 6 * (window.devicePixelRatio || 1);
-                // end marker gets first claim so it stays grabbable next to a cut
+                // end/start markers get first claim so they stay grabbable next to a cut
                 if (endLat !== null && Math.abs(xForTime(endTime()) - x) <= tol) return END_SEL;
+                if (startLat > 0 && Math.abs(xForTime(startTime()) - x) <= tol) return START_SEL;
                 for (let i = 0; i < cuts.length; i++) {
                     if (Math.abs(xForTime(cuts[i].t) - x) <= tol) return i;
                 }
@@ -584,6 +652,11 @@ app.registerExtension({
                     dragging = END_SEL;
                     seekFrame(endFrame());
                     canvas.setPointerCapture(e.pointerId);
+                } else if (hit === START_SEL) {
+                    selected = START_SEL;
+                    dragging = START_SEL;
+                    seekFrame(startFramePos());
+                    canvas.setPointerCapture(e.pointerId);
                 } else if (hit >= 0) {
                     selected = hit;
                     dragging = hit;
@@ -600,9 +673,14 @@ app.registerExtension({
                 const t = Math.max(0, Math.min(duration(), timeForX(canvasX(e))));
                 if (dragging === END_SEL) {
                     let E = Math.round(timeToFrame(t) / 8) + 1;
-                    E = Math.max(lastBoundaryLat() + 1, Math.min(totalLatents(), E));
+                    E = Math.max(lastBoundaryLat() + 1, startLat + 1, Math.min(totalLatents(), E));
                     endLat = E;
                     seekFrame(endFrame());
+                } else if (dragging === START_SEL) {
+                    let L = boundaryLatent(snapBoundary(timeToFrame(t)));
+                    L = Math.max(1, Math.min(firstCutLat() - 1, effLatents() - 1, L));
+                    startLat = L;
+                    seekFrame(startFramePos());
                 } else {
                     const p = snapBoundary(timeToFrame(t));
                     cuts[dragging].t = frameToTime(p);
@@ -612,7 +690,7 @@ app.registerExtension({
                 draw();
             });
             canvas.addEventListener("pointerup", () => {
-                if (dragging === END_SEL) {
+                if (dragging === END_SEL || dragging === START_SEL) {
                     dragging = -1;
                     syncWidget();
                     draw();
@@ -633,6 +711,13 @@ app.registerExtension({
                     e.stopPropagation();
                     endLat = null;
                     if (selected === END_SEL) selected = -1;
+                    syncWidget();
+                    draw();
+                } else if (hit === START_SEL) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    startLat = 0;
+                    if (selected === START_SEL) selected = -1;
                     syncWidget();
                     draw();
                 } else if (hit >= 0) {
@@ -672,6 +757,8 @@ app.registerExtension({
                         addCutAtPlayhead(); handled(); break;
                     case "e": case "E":
                         setEndAtPlayhead(); handled(); break;
+                    case "s": case "S":
+                        setStartAtPlayhead(); handled(); break;
                     case "x": case "X":
                         deleteSelected(); handled(); break;
                     case "Escape":
@@ -694,14 +781,21 @@ app.registerExtension({
                 const fileInfo = video.videoWidth === 0
                     ? "audio file"
                     : (detectedFps ? `~${detectedFps.toFixed(2)}` : "play to detect");
+                const genLatents = effLatents() - startLat;
                 const capInfo = endLat !== null
-                    ? `end @ frame ${endFrame()} -> cap ${8 * effLatents() - 7}`
+                    ? `end @ frame ${endFrame()} -> cap ${8 * genLatents - 7}`
                     : `no end marker (full video)`;
+                const startInfo = startLat > 0
+                    ? `  |  start @ frame ${startFramePos()} (skip ${startFramePos()})`
+                    : "";
                 lines.push(
                     `emit fps ${fps().toFixed(2)}  |  file fps ${fileInfo}  |  ` +
-                    `${totalFrames()} frames -> ${effLatents()} latents  |  ${capInfo}`
+                    `${totalFrames()} frames -> ${genLatents} gen latents  |  ${capInfo}${startInfo}`
                 );
-                if (selected === END_SEL && endLat !== null) {
+                if (selected === START_SEL && startLat > 0) {
+                    lines.push(`selected: START marker at frame ${startFramePos()} (latent ${startLat}) — ` +
+                               `frames before this are skipped (skip_first_frames ${startFramePos()})`);
+                } else if (selected === END_SEL && endLat !== null) {
                     lines.push(`selected: END marker at frame ${endFrame()} (latent ${effLatents()}) — ` +
                                `frames after this are excluded`);
                 } else if (selected >= 0) {
@@ -735,6 +829,7 @@ app.registerExtension({
                     pendingReset = false;
                     cuts = [];
                     endLat = null;
+                    startLat = 0;
                     selected = -1;
                     scheduleMismatch = false;
                     console.debug("[CutMarker] new media -> schedule reset");
@@ -770,7 +865,7 @@ app.registerExtension({
             function renderSig() {
                 return [
                     video.currentTime.toFixed(3), duration().toFixed(3),
-                    fps(), detectedFps ?? 0, selected, endLat ?? -1, dragging,
+                    fps(), detectedFps ?? 0, selected, endLat ?? -1, startLat, dragging,
                     peaks ? 1 : 0, video.videoWidth, scheduleMismatch ? 1 : 0,
                     cuts.map((c) => c.t.toFixed(3)).join(","),
                     scenesWidget.value,

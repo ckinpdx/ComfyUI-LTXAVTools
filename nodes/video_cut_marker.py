@@ -13,11 +13,16 @@ Cuts are time-anchored and computed in emit_fps frame space (default 25), so a
 schedule in the PIPELINE's frame space, not the file's.
 
 Outputs:
-- scene_lengths (STRING)  -> sampler `scene_lengths`
-- frame_count (INT)       -> total pixel frames (sum - 7), the matching empty-
-                             latent length, same pairing convention as the
-                             LTX Scene Length Calculator
-- video_path (STRING)     -> VHS Load Video (Path); this node does not decode
+- scene_lengths (STRING)   -> sampler `scene_lengths`
+- frame_count (INT)        -> total pixel frames (sum - 7), the matching empty-
+                              latent length, same pairing convention as the
+                              LTX Scene Length Calculator
+- video_path (STRING)      -> VHS Load Video (Path); this node does not decode
+- frame_load_cap (INT)     -> == frame_count; VHS loader cap
+- skip_first_frames (INT)  -> the start marker's pixel-frame offset; wire to the
+                              VHS loader so the generation begins there (0 = full
+                              video from the start). scene_lengths / frame_count
+                              already describe the region AFTER this offset.
 """
 
 import os
@@ -75,27 +80,36 @@ class LTXVideoCutMarker:
                                "native fps. The widget shows the file's detected fps "
                                "for reference only.",
                 }),
+                "start_frame": ("INT", {
+                    "default": 0, "min": 0, "max": 1_000_000,
+                    "tooltip": "Start marker offset in pixel frames (emit_fps space) — "
+                               "maintained by the timeline widget's start marker (S). "
+                               "Emitted as skip_first_frames for the VHS loader; 0 = "
+                               "start of video.",
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "INT", "STRING", "INT")
-    RETURN_NAMES = ("scene_lengths", "frame_count", "video_path", "frame_load_cap")
+    RETURN_TYPES = ("STRING", "INT", "STRING", "INT", "INT")
+    RETURN_NAMES = ("scene_lengths", "frame_count", "video_path",
+                    "frame_load_cap", "skip_first_frames")
     FUNCTION     = "mark"
     CATEGORY     = "LTXAVTools/utils"
     DESCRIPTION  = (
-        "Interactive timeline for marking scene boundaries (and an optional end "
-        "marker) on a video, snapped to the LTX latent grid. Emits the "
+        "Interactive timeline for marking scene boundaries (plus optional start "
+        "and end markers) on a video, snapped to the LTX latent grid. Emits the "
         "pipe-separated scene_lengths schedule for the AV Looping Sampler, the "
         "matching total frame_count (sum - 7), the video's path (for VHS Load "
-        "Video (Path)), and frame_load_cap — equal to frame_count by construction "
-        "— for the upstream loader so exactly the scheduled frames are loaded."
+        "Video (Path)), frame_load_cap (== frame_count) for the loader, and "
+        "skip_first_frames from the start marker so exactly the scheduled region "
+        "is loaded and generated."
     )
 
     @classmethod
-    def IS_CHANGED(s, video, scene_lengths, emit_fps):
-        return f"{video}|{scene_lengths}|{emit_fps}"
+    def IS_CHANGED(s, video, scene_lengths, emit_fps, start_frame=0):
+        return f"{video}|{scene_lengths}|{emit_fps}|{start_frame}"
 
-    def mark(self, video, scene_lengths, emit_fps):
+    def mark(self, video, scene_lengths, emit_fps, start_frame=0):
         video_path = folder_paths.get_annotated_filepath(video)
 
         # Normalize: ints, snapped to multiples of 8, zero-length scenes dropped.
@@ -115,10 +129,11 @@ class LTXVideoCutMarker:
 
         out = "|".join(str(v) for v in lengths)
         frame_count = (sum(lengths) - 7) if lengths else 0
+        skip = max(0, int(round(start_frame)))
 
         print(f"[LTXVideoCutMarker] scene_lengths: '{out}' | frame_count/load_cap: "
-              f"{frame_count} | video: {video_path}")
-        return (out, frame_count, video_path, frame_count)
+              f"{frame_count} | skip_first_frames: {skip} | video: {video_path}")
+        return (out, frame_count, video_path, frame_count, skip)
 
 
 NODE_CLASS_MAPPINGS = {
