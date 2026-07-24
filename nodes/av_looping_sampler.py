@@ -121,14 +121,42 @@ def _linear_overlap_blend(t1, t2, overlap, axis=2):
     return torch.cat([t1[tuple(sl_keep1)], blended, t2[tuple(sl_rest2)]], dim=axis)
 
 
+_GUIDE_KEYS = ("keyframe_idxs", "guide_attention_entries")
+
+
+def _strip_guide_keys(cond, label):
+    """Remove guide bookkeeping from conditioning. The sampler builds and
+    registers ALL its own guides per chunk; anything arriving pre-registered
+    is stale (upstream guide node, or a cached cond polluted by a previous
+    run) and desynchronizes core's pre_filter_counts validation."""
+    stripped = []
+    for t in cond:
+        found = [k for k in _GUIDE_KEYS if t[1].get(k) is not None]
+        if found:
+            print(f"[LTXVAVLoopingSampler] stripping stale guide conditioning "
+                  f"({', '.join(found)}) from {label} — the sampler adds its "
+                  f"own guides; wire clean text conditioning.")
+            d = {k: v for k, v in t[1].items() if k not in _GUIDE_KEYS}
+            stripped.append([t[0], d])
+        else:
+            stripped.append(t)
+    return stripped
+
+
 def _get_raw_conds(guider):
+    # raw_conds is a per-chunk hand-off set by _prepare_guider on its COPY of
+    # the guider — respect it. It is deliberately never written back onto the
+    # incoming guider: ComfyUI caches guider objects across queue runs, and a
+    # memo attached there persists (and accumulates guide bookkeeping) between
+    # runs — the "worked after cache clear" pre_filter_counts mismatch.
     if hasattr(guider, "raw_conds"):
         return guider.raw_conds
     raw_pos = guider.original_conds["positive"]
     raw_neg = guider.original_conds["negative"]
     positive = [[raw_pos[0]["cross_attn"], copy.deepcopy(raw_pos[0])]]
     negative = [[raw_neg[0]["cross_attn"], copy.deepcopy(raw_neg[0])]]
-    guider.raw_conds = (positive, negative)
+    positive = _strip_guide_keys(positive, "positive")
+    negative = _strip_guide_keys(negative, "negative")
     return positive, negative
 
 
@@ -286,6 +314,21 @@ class LTXVAVLoopingSampler:
                                "also set v2a_cross_attn=False (Cross-Attention Toggle) "
                                "or the guide lips corrupt generated audio.",
                 }),
+                "optional_denoise_mask": ("MASK", {
+                    "tooltip": "Spatial denoise mask over the generation: WHITE = "
+                               "regenerate, BLACK = keep pinned to the input latent's "
+                               "video content. A BASE-MODEL tool (region regeneration "
+                               "without a LoRA, region-varying video_cond_strength) — "
+                               "NOT for inpaint/clean-plate IC-LoRAs, which read their "
+                               "mask from painted reference pixels (LTX Inpaint Color "
+                               "Fill) and were never trained with a mask channel. "
+                               "Requires a real video in the input AV latent — kept "
+                               "regions reproduce it, so an empty latent pins black. "
+                               "Single mask = static; mask batches resample onto the "
+                               "latent grid (per-pixel-frame masks, e.g. SAM, work "
+                               "directly). Merged keep-wins (elementwise min) with "
+                               "video_cond_strength / overlap / keyframe masks.",
+                }),
             },
         }
 
@@ -399,6 +442,51 @@ class LTXVAVLoopingSampler:
         """Combine video noise mask + audio mask into a NestedTensor noise mask."""
         vm = get_noise_mask(video_latent_dict)
         return NestedTensor(ltxav.recombine_audio_and_video_latents(vm, audio_mask_tensor))
+
+    @staticmethod
+    def _prepare_spatial_mask(mask, T_lat, lat_h, lat_w):
+        """MASK (white = regenerate, black = keep) -> [1,1,T_lat,h,w] denoise
+        mask on the latent grid. A single-frame mask is static; multi-frame
+        masks are resampled temporally (per-pixel-frame masks land on the
+        8-frame latent grid via trilinear averaging)."""
+        m = mask.float()
+        if m.ndim == 2:
+            m = m.unsqueeze(0)                                    # [1,H,W]
+        elif m.ndim == 4:
+            m = m.squeeze(1) if m.shape[1] == 1 else m[0]
+        m = m.clamp(0.0, 1.0)[None, None]                         # [1,1,N,H,W]
+        N = m.shape[2]
+        if N == 1:
+            m = torch.nn.functional.interpolate(
+                m[:, :, 0], size=(lat_h, lat_w),
+                mode="bilinear", align_corners=False,
+            )[:, :, None].expand(-1, -1, T_lat, -1, -1).contiguous()
+        else:
+            px_expected = (T_lat - 1) * 8 + 1
+            if N not in (T_lat, px_expected):
+                print(f"[LTXVAVLoopingSampler] denoise mask has {N} frames; "
+                      f"expected {px_expected} pixel frames or {T_lat} latent "
+                      f"frames — resampling temporally.")
+            m = torch.nn.functional.interpolate(
+                m, size=(T_lat, lat_h, lat_w),
+                mode="trilinear", align_corners=False,
+            )
+        return m
+
+    @staticmethod
+    def _merge_video_mask(video_init, m):
+        """Merge a [1,1,T,h,w] denoise mask into video_init's noise_mask by
+        elementwise min — keep (low denoise) always wins over the scalar
+        strength masks. Must run BEFORE guide additions so temporal lengths
+        match the pre-token latent."""
+        s = video_init["samples"]
+        m = m.to(device=s.device, dtype=torch.float32)
+        existing = video_init.get("noise_mask")
+        if existing is None:
+            merged = m.expand(s.shape[0], -1, -1, -1, -1).clone()
+        else:
+            merged = torch.minimum(existing.to(torch.float32), m)
+        video_init["noise_mask"] = merged
 
     def _run_sampling(self, noise, guider, sampler, sigmas,
                       av_init, guiding_start_step, guiding_end_step,
@@ -514,7 +602,8 @@ class LTXVAVLoopingSampler:
         new_g = copy.copy(guider)
         positive, negative = _get_raw_conds(guider)
         idx = min(chunk_index, len(optional_positive_conditionings) - 1)
-        chunk_pos = optional_positive_conditionings[idx]
+        chunk_pos = _strip_guide_keys(
+            optional_positive_conditionings[idx], f"chunk {chunk_index} prompt")
         chunk_neg = negative
         # Per-chunk prompts are encoded from bare text and lack conditioning-level
         # values set upstream (e.g. ref_audio from LTXVReferenceAudio / ID-LoRA).
@@ -609,6 +698,7 @@ class LTXVAVLoopingSampler:
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         guiding_downscale_factor=1,
+        spatial_mask=None,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -652,6 +742,11 @@ class LTXVAVLoopingSampler:
                         positive, negative, vae, video_init,
                         img.unsqueeze(0), idx, cond_image_strength,
                     )
+
+        # Spatial keep-mask: merged BEFORE guide additions (mask must match the
+        # pre-token temporal length); keep always wins over the scalar masks.
+        if spatial_mask is not None:
+            self._merge_video_mask(video_init, spatial_mask[:, :, :T_v])
 
         # guiding latents (IC-LoRA) — first chunk starts at latent_idx 0
         if guiding_latents is not None:
@@ -748,6 +843,7 @@ class LTXVAVLoopingSampler:
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         ref_audio_swap=None,
         guiding_downscale_factor=1,
+        spatial_mask=None,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -819,6 +915,22 @@ class LTXVAVLoopingSampler:
             )
             v_mask[:, :, :temporal_overlap] = 1.0 - overlap_cond_strength
             video_init["noise_mask"] = v_mask
+
+        # Spatial keep-mask: slice the chunk's global window (local latent 0 =
+        # global n_acc - temporal_overlap) and merge BEFORE guide additions.
+        # Keep regions stay consistent across seams: the overlap carry already
+        # holds kept source content from the previous chunk.
+        if spatial_mask is not None:
+            g0 = n_acc - temporal_overlap
+            m = spatial_mask[:, :, g0 : g0 + T_v_chunk]
+            if m.shape[2] < T_v_chunk:
+                # final-chunk window overshoot: pad with regenerate (trimmed later)
+                pad = torch.ones(
+                    (m.shape[0], 1, T_v_chunk - m.shape[2], m.shape[3], m.shape[4]),
+                    device=m.device, dtype=m.dtype,
+                )
+                m = torch.cat([m, pad], dim=2)
+            self._merge_video_mask(video_init, m)
 
         positive, negative, video_init = self._add_latent_guide(
             vae, positive, negative, video_init,
@@ -1016,6 +1128,7 @@ class LTXVAVLoopingSampler:
         ref_bank=None,
         guiding_downscale_factor=1,
         video_cond_strength=0.0,
+        spatial_mask=None,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         chunk_idx    = 0
@@ -1083,6 +1196,7 @@ class LTXVAVLoopingSampler:
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
                 audio_cond_strength=audio_cond_strength,
                 video_cond_strength=video_cond_strength,
+                spatial_mask=spatial_mask,
                 adain_factor=adain_factor,
                 phase2_sampler=phase2_sampler,
                 phase2_guider=phase2_guider,
@@ -1185,6 +1299,7 @@ class LTXVAVLoopingSampler:
         optional_ref_audio_bank=None,
         guiding_downscale_factor=1.0,
         video_cond_strength=0.0,
+        optional_denoise_mask=None,
     ):
         # Accepts the FLOAT latent_downscale_factor output of LTX IC-LoRA
         # Loader Model Only (metadata-driven); integer factor internally.
@@ -1358,6 +1473,20 @@ class LTXVAVLoopingSampler:
                   f"{guiding_downscale_factor}, guide {g.shape[3]}x{g.shape[4]} -> "
                   f"dilated to {height}x{width} per chunk.")
 
+        # Spatial keep-mask: prepared once on the full latent grid (covers the
+        # whole working timeline, prior included), tile-sliced below.
+        spatial_mask_full = None
+        if optional_denoise_mask is not None:
+            spatial_mask_full = self._prepare_spatial_mask(
+                optional_denoise_mask, frames, height, width)
+            kept = float((spatial_mask_full < 0.5).float().mean())
+            print(f"[LTXVAVLoopingSampler] denoise mask active: "
+                  f"{kept * 100:.1f}% of the latent grid kept (pinned to input).")
+            if float(video_samples.abs().max()) < 1e-6:
+                print("[LTXVAVLoopingSampler] WARNING: denoise mask set but the "
+                      "input video latent is all zeros — kept regions will pin "
+                      "BLACK. Encode the source video into the input AV latent.")
+
         # spatial tile sizes
         base_tile_h = (height + (vertical_tiles   - 1) * spatial_overlap) // vertical_tiles
         base_tile_w = (width  + (horizontal_tiles - 1) * spatial_overlap) // horizontal_tiles
@@ -1414,6 +1543,10 @@ class LTXVAVLoopingSampler:
                     n = optional_normalizing_latents["samples"]
                     tile_norm = {"samples": n[:, :, :, vs:ve, hs:he]}
 
+                tile_spatial_mask = None
+                if spatial_mask_full is not None:
+                    tile_spatial_mask = spatial_mask_full[:, :, :, vs:ve, hs:he]
+
                 tile_video_out, tile_audio_out = self._process_temporal_chunks(
                     model=model, vae=vae, noise=noise,
                     sampler=sampler, sigmas=sigmas, guider=guider,
@@ -1453,6 +1586,7 @@ class LTXVAVLoopingSampler:
                     ref_bank=optional_ref_audio_bank,
                     guiding_downscale_factor=guiding_downscale_factor,
                     video_cond_strength=video_cond_strength,
+                    spatial_mask=tile_spatial_mask,
                 )
 
                 # accumulate video with spatial weights
