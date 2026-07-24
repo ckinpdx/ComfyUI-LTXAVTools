@@ -1149,6 +1149,152 @@ class LTXStreamingVideoEncode:
         return ({"samples": latent}, int(latent.shape[2]), int(frames_read))
 
 
+class LTXVideoOutpaintLatent:
+    """
+    Latent-space outpaint prep for the base-model (no-LoRA) path. Zero-pads an
+    encoded VIDEO latent spatially — real content in the center, ZEROS in the
+    margin — and emits the matching feathered denoise mask.
+
+    The zeros margin is the same empty substrate a from-scratch generation
+    starts from, so the sampler noises and regenerates it per the schedule.
+    This is the fix for "the model can't handle the padded pixels": encoding
+    padded pixels bakes STRUCTURED content (encoded black/grey/green is a
+    non-zero latent the model reads as "stuff is here" and tries to preserve),
+    whereas a zero margin is nothing to preserve — pure generation target.
+
+    Feed the padded latent (after concatenating audio) to the looping sampler's
+    `latents`, and the mask to `optional_denoise_mask`. **Run in a FULL-denoise
+    pass** so the margin actually regenerates — a low-denoise refinement won't
+    add enough noise to a bare margin (that's what `margin_fill = noise` is for,
+    experimental).
+
+    Padding is in pixels, snapped to the LTX spatial grid (÷32). Feather ramps
+    the mask INWARD into the original (blends the seam by partially regenerating
+    the original's edge); feathering into the zeros margin would blend toward
+    empty and muddy the seam, so it is deliberately one-directional.
+
+    No LoRA, no color fill. This addresses the black-artifact failure, not the
+    one-sided-context limit — strongest on moving-camera / simple margins.
+    """
+
+    VAE_SPATIAL = 32
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples": ("LATENT", {
+                    "tooltip": "Encoded VIDEO latent (5D [B,C,T,H,W]) — not an AV "
+                               "NestedTensor. Separate the video, outpaint it, then "
+                               "re-concat audio.",
+                }),
+                "left":   ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
+                "top":    ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
+                "right":  ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
+                "bottom": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
+                "overlap": ("INT", {
+                    "default": 0, "min": 0, "max": 512, "step": 8,
+                    "tooltip": "Full-regenerate band (px) of the original adjacent "
+                               "to the seam — fully rewritten (mask=1) so the seam "
+                               "sits inside one continuous generation, not on a "
+                               "partial-keep boundary. Then `feather` ramps to kept. "
+                               "Keep it small (~16-32); it discards that strip of "
+                               "real content. 0 = feather starts at the seam.",
+                }),
+                "feather": ("INT", {
+                    "default": 32, "min": 0, "max": 512, "step": 8,
+                    "tooltip": "Mask feather (px) INTO the original, beyond the "
+                               "overlap band, ramping regen->keep. 0 = hard edge.",
+                }),
+            },
+            "optional": {
+                "margin_fill": (["zeros", "noise"], {
+                    "default": "zeros",
+                    "tooltip": "zeros = correct for a full-denoise pass (the sampler "
+                               "noises it). noise = pre-populate the margin with unit "
+                               "noise for low-denoise passes (experimental — the "
+                               "sampler still adds its own noise on top).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "MASK")
+    RETURN_NAMES = ("latent", "denoise_mask")
+    FUNCTION     = "outpaint"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Zero-pads an encoded video latent for base-model outpaint (real centre, "
+        "empty margin) and emits the feathered denoise mask. Margin regenerates "
+        "cleanly because it is empty, not structured padded pixels. No LoRA."
+    )
+
+    def outpaint(self, samples, left, top, right, bottom, feather,
+                 overlap=0, margin_fill="zeros"):
+        v = samples["samples"]
+        if _HAS_NESTED and isinstance(v, NestedTensor):
+            raise ValueError(
+                "[LTXVideoOutpaintLatent] got an AV NestedTensor — separate the "
+                "video latent first (LTXVSeparateAVLatent), outpaint it, then "
+                "re-concat audio."
+            )
+        if v.ndim != 5:
+            raise ValueError(
+                f"[LTXVideoOutpaintLatent] expected a 5D video latent [B,C,T,H,W], "
+                f"got {v.ndim}D."
+            )
+        S = self.VAE_SPATIAL
+
+        def snap(p, name):
+            q = max(0, int(round(p / S)) * S)
+            if q != p:
+                print(f"[LTXVideoOutpaintLatent] {name} {p} snapped to {q} (÷{S}).")
+            return q
+
+        left, top, right, bottom = (snap(left, "left"), snap(top, "top"),
+                                    snap(right, "right"), snap(bottom, "bottom"))
+        Lc, Tc, Rc, Bc = left // S, top // S, right // S, bottom // S
+        B, C, T, H, W = v.shape
+
+        # zero-pad the latent spatially (F.pad's last-dims-first order: W then H)
+        v_pad = torch.nn.functional.pad(v, (Lc, Rc, Tc, Bc), value=0.0)
+
+        if margin_fill == "noise":
+            gen = torch.randn_like(v_pad)
+            keep = torch.zeros((1, 1, 1, v_pad.shape[3], v_pad.shape[4]),
+                               dtype=v_pad.dtype, device=v_pad.device)
+            keep[..., Tc:Tc + H, Lc:Lc + W] = 1.0
+            v_pad = torch.where(keep.bool(), v_pad, gen)
+
+        # feathered denoise mask at padded PIXEL resolution (single frame)
+        H_out, W_out = (Tc + Bc + H) * S, (Lc + Rc + W) * S
+        y0, x0 = Tc * S, Lc * S
+        y1, x1 = y0 + H * S, x0 + W * S
+        dev = v.device
+        yy = torch.arange(H_out, device=dev).view(-1, 1).float()
+        xx = torch.arange(W_out, device=dev).view(1, -1).float()
+        BIG = float(max(H_out, W_out) + 1)
+        dt = (yy - y0)      if top    > 0 else torch.full((H_out, 1), BIG, device=dev)
+        db = (y1 - 1 - yy)  if bottom > 0 else torch.full((H_out, 1), BIG, device=dev)
+        dl = (xx - x0)      if left   > 0 else torch.full((1, W_out), BIG, device=dev)
+        dr = (x1 - 1 - xx)  if right  > 0 else torch.full((1, W_out), BIG, device=dev)
+        d = torch.minimum(torch.minimum(dt, db), torch.minimum(dl, dr))  # -> [H_out,W_out]
+        in_orig = ((yy >= y0) & (yy < y1)) & ((xx >= x0) & (xx < x1))
+        # d = distance into the original from the seam. [0, overlap) fully
+        # regenerates (mask 1); [overlap, overlap+feather) ramps 1->0; beyond
+        # keeps (mask 0).
+        if feather > 0:
+            orig_vals = ((overlap + feather - d) / feather).clamp(0.0, 1.0)
+        else:
+            orig_vals = (d < overlap).float()
+        mask = torch.where(in_orig, orig_vals.expand(H_out, W_out),
+                           torch.ones(H_out, W_out, device=dev)).unsqueeze(0)
+
+        print(f"[LTXVideoOutpaintLatent] {W}x{H} latent -> {v_pad.shape[4]}x"
+              f"{v_pad.shape[3]} (pad cells L{Lc} T{Tc} R{Rc} B{Bc}); "
+              f"margin={margin_fill}, overlap {overlap}px, feather {feather}px.")
+        return ({"samples": v_pad}, mask)
+
+
 NODE_CLASS_MAPPINGS = {
     "PreviewImagePassthrough":          PreviewImagePassthrough,
     "LTXAVLatentCheck":                 LTXAVLatentCheck,
@@ -1161,6 +1307,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXAVStreamingSave":               LTXAVStreamingSave,
     "LTXStreamingVideoEncode":          LTXStreamingVideoEncode,
     "LTXInpaintColorFill":              LTXInpaintColorFill,
+    "LTXVideoOutpaintLatent":           LTXVideoOutpaintLatent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1175,4 +1322,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXAVStreamingSave":               "LTX AV Streaming Decode & Save",
     "LTXStreamingVideoEncode":          "LTX Streaming Video Encode",
     "LTXInpaintColorFill":              "LTX Inpaint Color Fill",
+    "LTXVideoOutpaintLatent":           "LTX Video Outpaint Latent",
 }
