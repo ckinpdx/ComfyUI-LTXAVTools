@@ -840,6 +840,100 @@ class LTXAVStreamingSave:
         }
 
 
+class LTXInpaintColorFill:
+    """
+    Composites a solid fill color where the mask is active — inpaint guide
+    prep for IC-LoRAs that read the mask from the reference pixels. Color
+    conventions differ per LoRA (Lightricks in/outpainting: #66FF00 green;
+    community masked-inpaint LoRAs: magenta mask / chroma green fill), so the
+    color is a preset choice with a custom hex fallback, unlike core's
+    hardcoded LTXVInpaintPreprocess.
+
+    Composite at the FINAL encode resolution (resize source and mask first) —
+    resizing after compositing smears the fill boundary into off-colors the
+    LoRA was never trained on. `binarize` (default on) thresholds the mask so
+    the fill is exact even from soft/grown masks.
+    """
+
+    _PRESETS = {
+        "magenta (255,0,255)":         (255, 0, 255),
+        "chroma green (0,255,0)":      (0, 255, 0),
+        "lightricks green (102,255,0)": (102, 255, 0),
+    }
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK", {
+                    "tooltip": "White = filled with the color. Single-frame "
+                               "masks broadcast to the video length.",
+                }),
+                "color": (list(s._PRESETS) + ["custom"], {
+                    "default": "magenta (255,0,255)",
+                }),
+                "custom_hex": ("STRING", {
+                    "default": "#FF00FF",
+                    "tooltip": "Used when color = custom. #RRGGBB.",
+                }),
+                "binarize": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Threshold the mask at 0.5 so the fill color is "
+                               "exact (soft mask edges would blend off-colors).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION     = "fill"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Solid-color mask fill for inpaint IC-LoRA references (magenta / "
+        "chroma green / Lightricks green / custom). Exact colors, unlike "
+        "resize-after-composite pipelines."
+    )
+
+    def fill(self, images, mask, color, custom_hex, binarize):
+        if color == "custom":
+            h = custom_hex.strip().lstrip("#")
+            if len(h) != 6:
+                raise ValueError(
+                    f"[LTXInpaintColorFill] custom_hex must be #RRGGBB, got "
+                    f"{custom_hex!r}"
+                )
+            rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        else:
+            rgb = self._PRESETS[color]
+
+        m = mask
+        if m.ndim == 4:
+            m = m[:, :, :, 0]
+        if binarize:
+            m = (m > 0.5).float()
+        if m.shape[0] == 1 and images.shape[0] > 1:
+            m = m.expand(images.shape[0], -1, -1)
+        n = min(m.shape[0], images.shape[0])
+        if n < images.shape[0]:
+            print(f"[LTXInpaintColorFill] mask has {m.shape[0]} frames, video "
+                  f"{images.shape[0]} — output truncated to {n}.")
+        m = m[:n].to(images.device, images.dtype)
+        imgs = images[:n]
+        if m.shape[1:] != imgs.shape[1:3]:
+            m = torch.nn.functional.interpolate(
+                m[:, None], size=imgs.shape[1:3], mode="nearest",
+            )[:, 0]
+            print(f"[LTXInpaintColorFill] mask resized to {imgs.shape[2]}x"
+                  f"{imgs.shape[1]} (nearest — composite at final resolution "
+                  f"to avoid this).")
+
+        m4 = m.unsqueeze(-1)
+        fill = torch.tensor(rgb, device=imgs.device, dtype=imgs.dtype) / 255.0
+        out = imgs * (1 - m4) + fill.view(1, 1, 1, 3) * m4
+        return (out,)
+
+
 class LTXStreamingVideoEncode:
     """
     Chunked VAE encode straight from a video file — the full pixel tensor
@@ -1066,6 +1160,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXLoraMetadataReader":            LTXLoraMetadataReader,
     "LTXAVStreamingSave":               LTXAVStreamingSave,
     "LTXStreamingVideoEncode":          LTXStreamingVideoEncode,
+    "LTXInpaintColorFill":              LTXInpaintColorFill,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1079,4 +1174,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXLoraMetadataReader":            "LTX LoRA Metadata Reader",
     "LTXAVStreamingSave":               "LTX AV Streaming Decode & Save",
     "LTXStreamingVideoEncode":          "LTX Streaming Video Encode",
+    "LTXInpaintColorFill":              "LTX Inpaint Color Fill",
 }
