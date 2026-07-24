@@ -1021,30 +1021,58 @@ class LTXStreamingVideoEncode:
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise ValueError(f"[LTXStreamingVideoEncode] could not open: {path}")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        base_t   = (1.0 / fps) if fps > 0 else 0.0
-        target_t = (1.0 / force_rate) if force_rate > 0 else base_t
-        time_acc = 0.0
-        yielded = skipped = 0
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        out_fps = force_rate if force_rate > 0 else native_fps
         try:
-            while True:
-                if not cap.grab():
-                    break
-                if force_rate > 0 and fps > 0:
-                    time_acc += base_t
-                    if time_acc < target_t:
+            # No resample (rates equal or unknown): 1:1 passthrough.
+            if native_fps <= 0 or out_fps <= 0 or abs(out_fps - native_fps) < 1e-6:
+                skipped = emitted = 0
+                while True:
+                    if not cap.grab():
+                        break
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        break
+                    if skipped < skip:
+                        skipped += 1
                         continue
-                    time_acc -= target_t
-                ok, frame = cap.retrieve()
-                if not ok:
-                    break
+                    yield frame  # BGR uint8 HWC
+                    emitted += 1
+                    if cap_frames and emitted >= cap_frames:
+                        break
+                return
+
+            # Nearest/hold resample so OUTPUT-frame indices match a VHS
+            # force_rate stream: duplicates when upsampling (e.g. 24->25),
+            # drops when downsampling. skip / cap_frames count OUTPUT frames —
+            # the same emit_fps space the Cut Marker emits, so its
+            # skip_first_frames / frame_load_cap land on the same content the
+            # VHS loader sees. Output frame j sources native frame
+            # floor(j * native_fps / out_fps); the index is recomputed per j
+            # (no float accumulation) so it can't drift over long videos.
+            in_idx = -1
+            out_idx = 0
+            skipped = emitted = 0
+            frame = None
+            while True:
+                need = int(out_idx * native_fps / out_fps)
+                while in_idx < need:
+                    if not cap.grab():
+                        return
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        return
+                    in_idx += 1
+                out_idx += 1
+                if frame is None:
+                    continue
                 if skipped < skip:
                     skipped += 1
                     continue
-                yield frame  # BGR uint8 HWC
-                yielded += 1
-                if cap_frames and yielded >= cap_frames:
-                    break
+                yield frame
+                emitted += 1
+                if cap_frames and emitted >= cap_frames:
+                    return
         finally:
             cap.release()
 
