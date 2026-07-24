@@ -18,7 +18,7 @@ Aspect-ratio-aware resolution picker. Outputs only LTX-compatible resolutions (d
 - **`full (final)`** — the custom size is the final resolution; snapped to ÷64 so the derived half stays ÷32. (custom 960×512 → full 960×512, half 480×256.)
 
 ### LTX Dimension Calculator 3 Stage
-Same as above but constrained to div-by-128 resolutions, compatible with 3-stage pipelines (full / half / quarter resolutions all remain div-by-32).
+Same as above but constrained to div-by-128 resolutions, compatible with 3-stage pipelines (full / half / quarter resolutions all remain div-by-32). Matching the base calculator, a `use_custom` toggle overrides the dropdown with `custom_width`/`custom_height` interpreted by `custom_role` — `quarter (stage 1)` scales ×4 to full (the input-video case: stage 1 matches the source), `half (stage 2)` ×2, `full (final)` derives the stages down. Each role snaps to its own grid (÷32 / ÷64 / ÷128) so every derived stage stays LTX-valid; `label` shows the full `quarter → half → full` chain.
 
 **Outputs:** `width`, `height`, `width_half`, `height_half`, `width_quarter`, `height_quarter`, `label`
 
@@ -48,18 +48,21 @@ Authors variable scene lengths for the AV Looping Sampler. Takes scene durations
 `actual_seconds` (= `frame_count / fps`) matches the LTX Frame Calculator convention — use it to trim input audio to the exact video duration in conditioned-audio workflows.
 
 ### LTX Video Cut Marker (Scenes)
-Interactive timeline widget for authoring a scene schedule against real media. Load a **video or audio file** (picker, upload button, or drag-and-drop) — audio files show a **waveform** on the timeline (videos show their soundtrack's waveform too), so scenes can be cut against a song's sections visually. Cuts mark scene boundaries, hard-snapped to the LTX latent grid; an optional **end marker** (red, `E`) truncates the schedule and everything downstream.
+Interactive timeline widget for authoring a scene schedule against real media. Load a **video or audio file** (picker, upload button, or drag-and-drop) — audio files show a **waveform** on the timeline (videos show their soundtrack's waveform too), so scenes can be cut against a song's sections visually. Cuts mark scene boundaries, hard-snapped to the LTX latent grid; an optional **end marker** (red, `E`) truncates the schedule, and an optional **start marker** (blue, `S`) trims the head — the schedule is then measured across the `[start, end]` window.
 
 Indices are **time-anchored and emitted in `emit_fps` frame space** (default 25): a 24fps source marked while emitting at 25 — the VHS `force_rate` case — produces a schedule in the *pipeline's* frame space, not the file's.
 
-Controls: double-click / `C` = add cut · drag = move (snapped) · click = select · ←/→ = nudge one latent · right-click / `X` / Del = delete · `E` = end marker · Space = play · Alt+←/→ = fine playhead step.
+An **auto-cut** control (interval box + ⚡ button) replaces all cuts with one every N seconds, grid-snapped, from the start marker to the end. Loading **new media** resets the schedule (the workflow-restore path is untouched, so a page refresh still restores saved state).
+
+Controls: double-click / `C` = add cut · drag = move (snapped) · click = select · ←/→ = nudge one latent · right-click / `X` = delete · `S` = start marker · `E` = end marker · Space = play · Alt+←/→ = fine playhead step. (`Del` is intentionally *not* a marker-delete — it stays ComfyUI's delete-node.)
 
 | Output | Description |
 |---|---|
 | `scene_lengths` | Pipe-separated px counts incl. the final scene → sampler `scene_lengths` |
-| `frame_count` | `sum − 7` — the matching empty-latent length |
+| `frame_count` | `sum − 7` — the matching empty-latent length (of the `[start, end]` window) |
 | `video_path` | → VHS Load Video (Path); this node does not decode |
 | `frame_load_cap` | = `frame_count` — cap the upstream loader to exactly the scheduled frames |
+| `skip_first_frames` | Start marker's pixel-frame offset → VHS loader's `skip_first_frames` (0 = from the start) |
 
 ### LTX Keyframe Planner
 Turns a `scene_lengths` schedule into **end-anchored keyframe indices** for keyframe-travel generation: frame `0` opens (optional), each scene travels to a keyframe at **its own end** — landing in its own chunk so generation converges on the image and the next scene inherits through the overlap carry — and the final scene closes on `-1` (optional). `128|128|96` → `0,120,248,-1`.
@@ -118,6 +121,19 @@ The input-side mirror: encodes a video **file** to latents in temporal chunks �
 **Outputs:** `latent`, `num_latents`, `num_frames`. Sources ending mid-latent are trimmed to the valid `(T−1)×8+1` count with a console note. Preprocessed branches (DWPose/depth) save their video to disk first, then stream-encode the file.
 
 ---
+
+### LTX Inpaint Color Fill
+Composites a solid fill color where the mask is active — inpaint-guide prep for IC-LoRAs that read the mask from the reference **pixels** (unlike `optional_denoise_mask`, which is the LoRA-less base-model path). Color is a preset (magenta `255,0,255` / chroma green `0,255,0` / Lightricks green `102,255,0`) or a custom hex, so it covers every LoRA's trained convention — core's `LTXVInpaintPreprocess` hardcodes one green. `binarize` (default on) thresholds the mask so the fill color is exact even from soft/grown masks. **Composite at the final encode resolution** (resize source and mask first) — resizing after compositing smears the boundary into off-colors the LoRA never trained on.
+
+| Input | Default | Description |
+|---|---|---|
+| `images` | — | Video frames |
+| `mask` | — | White = filled with the color; single-frame masks broadcast to the video length |
+| `color` | magenta | Preset or `custom` |
+| `custom_hex` | `#FF00FF` | Used when `color = custom` |
+| `binarize` | true | Threshold the mask at 0.5 for an exact fill |
+
+**Output:** `image`. Only needed for the IC-LoRA inpaint route; base-model inpainting uses `optional_denoise_mask` alone (no color fill).
 
 ### LTX Audio Latent Trim
 Trims a 4D audio latent `[B, C, T, F]` along the temporal axis. Supports negative indexing. Used to extract context and output windows in sliding-window loops.
@@ -330,6 +346,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `phase2_start_step` | 0 | Schedule step where phase 2 takes over. 0 = disabled. |
 | `optional_prior_av_latent` | — | Existing AV latent to **continue from**, treated as a prior chunk. The accumulator is seeded with it and generation continues after it via the overlap mechanism — no masks, no re-sampling of the prior. `latents` then defines only the **new** region to generate. Output is prior + continuation. |
 | `guiding_downscale_factor` | 1.0 | **Small-grid IC-LoRA reference factor** — wire from the LoRA Metadata Reader (or IC-LoRA Loader Model Only) so the LoRA's `reference_downscale_factor` metadata drives it (pixel spatial upscaler x2 = 2, x4 = 4). The guiding latent must then be `gen_dims/factor` — e.g. the stage-1 latent **directly** for a 2× pass. Each chunk's guide slice is dilated onto the full grid with RoPE-adjusted patch spans (the trained reference geometry); dilation-hole tokens are filtered before attention, so the reference overhead is only the small-grid token count. 1 = normal dense reference (Ingredients, CrossView, depth/pose). Spatial tiling >1×1 not supported with factor >1. |
+| `optional_denoise_mask` | — | **Spatial inpaint mask** (white = regenerate, black = keep pinned to the input latent's video). The pack's primary inpainting path — **no inpaint LoRA needed**: the mask states "synthesize here / reproduce the rest" structurally, and the fill coheres because the model sees the pinned latent while denoising. Requires real video in the input latent (v2v; empty pins black). Single mask = static; batches (e.g. SAM per-frame) resample onto the latent grid. Merged keep-wins (min) with `video_cond_strength` / overlap / keyframe masks. Keep `video_cond_strength 0`. See the field guide §5b. IC-LoRA route (Inpaint Color Fill + inpaint LoRA) is the fallback for large holes / hard edits. |
 
 ### Continuing an existing video
 

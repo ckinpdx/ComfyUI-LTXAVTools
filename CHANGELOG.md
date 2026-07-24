@@ -3,6 +3,40 @@
 ## 1.1.0 — 2026-07-15
 
 ### Added
+- **Video Cut Marker: start marker** (2026-07-22, confirmed): blue `S` marker
+  trims the head; new `skip_first_frames` output (appended) wires to the VHS
+  loader so generation begins there. The schedule is measured across the
+  `[start, end]` window; the offset round-trips via a new appended
+  `start_frame` widget. Both additions are append-only (existing links/values
+  preserved).
+- **Video Cut Marker: auto-cut placer + new-media reset** (2026-07-21,
+  confirmed): an interval box + ⚡ button replaces all cuts with one every N
+  seconds (grid-snapped, start→end); loading new media (combo change or
+  upload) resets the schedule while the workflow-restore path stays untouched
+  (F5 still restores). `Del`/`Backspace` no longer delete markers (they remain
+  ComfyUI's delete-node); `X` / right-click / ✕ do.
+- **Dimension Calculator 3 Stage: custom override** (2026-07-21, confirmed):
+  `use_custom` + `custom_role` (`quarter (stage 1)` ×4 / `half (stage 2)` ×2 /
+  `full (final)`) mirroring the base calculator, each role snapping to its own
+  grid (÷32 / ÷64 / ÷128) so every derived stage stays LTX-valid. Appended
+  optional inputs — existing graphs unchanged.
+- **AV Looping Sampler: spatial denoise mask** (`optional_denoise_mask`,
+  2026-07-22, validated): base-model inpainting with **no inpaint LoRA** —
+  white = regenerate, black = keep pinned to the input latent's video. The
+  mask states "synthesize here / reproduce the rest" structurally, so the
+  IC-LoRA's role on the *where* is redundant; the fill coheres because the
+  model sees the pinned latent while denoising (one scene, not a composite).
+  Merged keep-wins (elementwise min) with `video_cond_strength` / overlap /
+  keyframe masks; single mask static, batches resample onto the latent grid
+  (SAM per-frame works directly); spatial tiling supported. Requires real
+  video in the input latent. See field guide §5b. This is now the pack's
+  primary inpaint path; the IC-LoRA route is the large-hole / hard-edit
+  fallback.
+- **LTX Inpaint Color Fill** (2026-07-22): solid-color mask fill for the
+  IC-LoRA inpaint route — magenta / chroma green / Lightricks green presets +
+  custom hex (core's `LTXVInpaintPreprocess` hardcodes one green), `binarize`
+  for exact fills. Composite at final resolution to keep the boundary color
+  exact.
 - **LTX Streaming Video Encode** (2026-07-21/22, validated — long-latent
   roundtrip with no stitches): chunked VAE encode straight from a video file,
   the input mirror of the streaming save. Causal left-context per chunk
@@ -30,6 +64,14 @@
   chunked long-form pixel upscaling. Factor 1 = unchanged dense references.
 
 ### Fixed
+- **Conditioning sanitizer — stale guide bookkeeping stripped on entry**
+  (2026-07-22): the sampler now removes any `keyframe_idxs` /
+  `guide_attention_entries` from incoming conditioning (it builds its own
+  guides per chunk) and no longer memoizes `raw_conds` onto the cached guider.
+  Fixes the intermittent `guide pre_filter_counts != keyframe grid mask
+  length` that "went away after a cache clear" — guide bookkeeping was
+  accumulating on a ComfyUI-cached guider across queue runs. Prints
+  `stripping stale guide conditioning …` when it acts.
 - **Guide attention-entry registration is now measured, not predicted**
   (2026-07-17): pre_filter_count read from the actual keyframe_idxs delta, so
   registration survives core frame-accounting changes (fixes

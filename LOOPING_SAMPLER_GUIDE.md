@@ -183,6 +183,60 @@ They stack.
 
 ---
 
+## 5b. Spatial denoise mask (inpainting)
+
+### `optional_denoise_mask`
+
+A spatial mask over the generation: **white = regenerate, black = keep** pinned to the
+input latent's video content (standard Comfy denoise-mask polarity). This is the pack's
+**primary inpainting path — no inpaint LoRA required.**
+
+Why no LoRA: the LTX inpaint / in-outpainting IC-LoRAs exist only to teach the model
+"this painted-color region means synthesize here, reproduce the rest." The denoise mask
+states that *structurally*, so the LoRA's role on the **where** is redundant. And the fill
+coheres with the kept region — matching its light, shadow, and geometry — because the model
+sees the pinned latent **while** denoising: it completes one scene, not two glued layers
+(the difference from a decode-then-composite).
+
+**Wiring (base-model inpaint):**
+
+```
+source video → VAE encode (video) ─┐
+source/empty audio → (audio) ───────┴─ LTXVConcatAVLatent → latents   (the pinned content)
+SAM / painted mask ───────────────────────────────────────→ optional_denoise_mask
+```
+
+- No guide, no color fill, no IC-LoRA. Just the source in the init latent and the mask.
+- **Requires real video in the input AV latent** — kept regions reproduce it, so an
+  all-zeros latent pins **black** (the sampler warns). This is a v2v tool.
+- Prompt describes the *whole* scene as it should look after the edit (the masked region
+  included), same as any inpaint prompt.
+- `video_cond_strength` stays **0** — the mask does the holding. (A nonzero value would
+  also hold the white region: the merge is elementwise-min, so `min(1, 1−vcs) = 1−vcs`
+  leaks a hold into the regen area.)
+
+**Mask formats:** a single mask is static across all frames; a mask **batch** is resampled
+onto the latent grid (per-pixel-frame masks — e.g. SAM at the video's frame count — land
+directly; per-latent-frame batches also accepted). The mask min-merges keep-wins with the
+`video_cond_strength` / overlap / keyframe masks, so a keep region always wins. Spatial
+tiling is supported (unlike small-grid guides). The console prints `denoise mask active:
+N% kept` — sanity-check it against what you painted (≈0% kept = inverted polarity).
+
+**Boundary artifacts:** if halos appear where kept meets regenerated, feather the mask
+(soft grey falloff) — fractional values interpolate through the same merge math.
+
+### When the IC-LoRA route still wins (the fallback)
+
+Reach for **LTX Inpaint Color Fill** + an inpaint IC-LoRA (guide + `guiding_downscale_factor`
+from metadata, §7) for the cases the base model struggles with: **large holes** where most
+of the region must be hallucinated from little surrounding context, and **hard semantic
+edits** the base model resists. Color Fill paints the masked region the LoRA's trained
+color (magenta / chroma green / Lightricks green) — composite at final resolution so the
+boundary stays exact. For ordinary object removal, face swaps, and localized changes,
+base + mask is simpler and sufficient.
+
+---
+
 ## 6. Audio levers
 
 ### `audio_cond_strength`
@@ -414,6 +468,12 @@ as the shot opens" · `audio_cond_strength 1.0` · camera motion carried by the 
 `optional_cond_image_indices` with the last existing frame as the keyframe image ·
 `existing_denoise` 0.1–0.3 for light seam refinement.
 
+**Inpaint / object removal (base model, no LoRA)**
+Source video → encode → `latents` (the pinned content) · SAM/painted mask →
+`optional_denoise_mask` (white = the region to change) · `video_cond_strength 0` · prompt
+describes the finished scene · no guide, no color fill. IC-LoRA route (Color Fill + inpaint
+LoRA) only for large holes / hard edits (§5b).
+
 **Character state pinning across camera moves**
 Character LoRA for identity + single full-body reference in
 `optional_negative_index_latents` at strength ~0.6 · reference at generation resolution,
@@ -448,7 +508,9 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Gibberish generated speech over a guide video (changing the words) | the guide's visible lips out-muscle the text via v2a — set `v2a_cross_attn = False` on the **LTX AV Cross-Attention Toggle** node. Text drives the audio; a2v resyncs the mouth. Only bites during generation; irrelevant with input audio. |
 | Lips move during silence over a guide video | the guide's original lip motion bleeds through where the new audio is silent — fill the runtime with dialog (no dead air), and/or free the mouth more (higher CrossView regeneration, lower guide/overlap strength) so a2v dominates it. |
 | Crash: `expanded size of tensor … must match` inside attention, with MultimodalGuider | STG perturbed pass × any sub-1.0 guide strength (incl. `cond_image_strength 0.5`) breaks core's guide-mask attention. Set `perturb_attn=false`/`stg=0` in GuiderParameters (keeps per-modality CFG), or keep all guide strengths at 1.0 and window via `guiding_start/end_step` |
-| Crash: `guide pre_filter_counts != keyframe grid mask length` | stale guide conditioning from an upstream guide node (LTXVAddGuide / IC-LoRA guide) — feed the sampler clean text encodes; references go through `optional_guiding_latents` only |
+| Crash: `guide pre_filter_counts != keyframe grid mask length` | stale guide conditioning — either an upstream guide node (LTXVAddGuide / IC-LoRA guide) or a cached cond polluted across queue runs. The sampler now **auto-strips** guide bookkeeping on entry (prints `stripping stale guide conditioning …`) and no longer memoizes onto the cached guider, so this should be fixed. If it still fires, note what the strip message names and report it; references go through `optional_guiding_latents` only |
+| Inpaint: masked region unchanged, or whole frame drifts | `optional_denoise_mask` — unchanged = polarity inverted (white must be the regen region; check the `N% kept` console line) or the mask isn't reaching the model; whole-frame drift = mask absent so nothing is pinned. Needs real video in the input latent (§5b) |
+| Inpaint fill looks pasted-on / large hole invents wrong structure | base model has too little surrounding context — switch to the IC-LoRA route (LTX Inpaint Color Fill + inpaint LoRA, §5b fallback) |
 | Crash: `size of tensor a … must match b` in `_linear_overlap_blend` with a prior latent | the continuation prior is shorter than `temporal_overlap` — use a prior of at least the overlap in pixel frames (≥ ~2s at overlap 48; more gives the carry real substance) |
 | Keyframes silently ignored (unconditioned output despite indices set) | `optional_cond_images` missing/bypassed — indices without images degrade silently by design. Also check count: images pair with indices via zip, and the shorter list wins (extra indices dropped without warning; Keyframe Planner's `count` output is the check) |
 | Small-grid IC-LoRA (pixel upscaler) has no effect | reference fed dense/full-res — these LoRAs need `guiding_downscale_factor` set (from metadata) with the guide at `gen_dims/factor` (§7 small-grid) |
