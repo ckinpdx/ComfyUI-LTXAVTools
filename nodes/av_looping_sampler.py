@@ -741,21 +741,6 @@ class LTXVAVLoopingSampler:
         # Spatial keep-mask: merged BEFORE guide additions (mask must match the
         # pre-token temporal length); keep always wins over the scalar masks.
         if spatial_mask is not None:
-            # DIAGNOSTIC: what is the init actually holding under the mask? If
-            # the region was zeroed upstream this is ~0; a nonzero value means
-            # the sampler's init still carries the original content there (the
-            # zeroed latent isn't what reached `latents`).
-            sm = spatial_mask[:, :, :T_v].to(video_init["samples"].device)
-            reg = (sm > 0.5)  # regenerate region
-            si = video_init["samples"]
-            if reg.any():
-                reg_b = reg.expand_as(si)
-                masked_mag = float(si[reg_b].abs().mean())
-                kept_mag = float(si[~reg_b].abs().mean()) if (~reg_b).any() else 0.0
-                print(f"[LTXVAVLoopingSampler] DIAG init |x| in REGEN region: "
-                      f"{masked_mag:.4f} | in KEEP region: {kept_mag:.4f} — "
-                      f"regen should be ~0 if the latent was zeroed; nonzero "
-                      f"means the ORIGINAL content is the sampler's init there.")
             self._merge_video_mask(video_init, spatial_mask[:, :, :T_v])
 
         # guiding latents (IC-LoRA) — first chunk starts at latent_idx 0
