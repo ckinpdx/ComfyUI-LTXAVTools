@@ -33,8 +33,13 @@ def ltx_mask_to_latent(m, T, lat_h, lat_w, mode="max"):
     elif m.ndim == 4:
         m = m.squeeze(1) if m.shape[1] == 1 else m[0]
     m = m.float().clamp(0.0, 1.0)                                       # [N,H,W]
-    ms = F.interpolate(m.unsqueeze(1), size=(lat_h, lat_w),
-                       mode="bilinear", align_corners=False).squeeze(1)  # [N,lh,lw]
+    # Spatial downsample by MAX, not bilinear: a latent cell must be masked if
+    # the subject touches it AT ALL. Bilinear point-samples a 32x reduction, so
+    # the whole boundary ring reads ~0 (silently treated as KEEP -> pinned to
+    # the init, which decodes as a grey ring after a noise-fill) and thin
+    # features come out fractional (mask < 1 re-blends the init every step, see
+    # comfy samplers.py CFGGuider.__call__). Max matches the temporal reduction.
+    ms = F.adaptive_max_pool2d(m.unsqueeze(1), (lat_h, lat_w)).squeeze(1)  # [N,lh,lw]
     N = ms.shape[0]
     if N == 1:
         out = ms.expand(T, -1, -1)
@@ -632,14 +637,31 @@ class LTXLoraMetadataReader:
             header = json.loads(f.read(header_len).decode("utf-8"))
         md = header.get("__metadata__", {}) or {}
 
+        # Key lookup is prefix-agnostic: Lightricks' own IC-LoRAs write
+        # `reference_downscale_factor`, while LoRAs trained through
+        # sd-scripts/kohya/musubi prefix training metadata with `ss_`
+        # (`ss_reference_downscale_factor`). Match the bare key first, then any
+        # key ending in it, so future prefixes work without another edit.
+        raw, src_key = None, None
+        for k in ("reference_downscale_factor", "ss_reference_downscale_factor"):
+            if k in md:
+                raw, src_key = md[k], k
+                break
+        if raw is None:
+            for k in md:
+                if k.endswith("reference_downscale_factor"):
+                    raw, src_key = md[k], k
+                    break
+
         try:
-            factor = max(1.0, float(md.get("reference_downscale_factor", 1)))
+            factor = max(1.0, float(raw if raw is not None else 1))
         except (TypeError, ValueError):
             factor = 1.0
 
         meta_str = json.dumps(md, indent=2) if md else "(no metadata)"
-        print(f"[LTXLoraMetadataReader] {lora_name}: "
-              f"reference_downscale_factor={factor} | {len(md)} metadata keys")
+        found = f"{src_key}={factor}" if src_key else f"no factor key (default {factor})"
+        print(f"[LTXLoraMetadataReader] {lora_name}: {found} | "
+              f"{len(md)} metadata keys")
         return (path, factor, meta_str)
 
 
