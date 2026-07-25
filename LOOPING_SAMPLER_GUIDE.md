@@ -261,9 +261,22 @@ and no guide). Removal must happen in **pixel space, before the encode**.
 VAE encode → **latent zero**. Both cleans are required — the noise-fill deletes
 the subject from the source so it's gone from the latent everywhere (the kept
 cells the zero can't reach), and the zero empties the hole so the model reads
-nothing there (at a sigma≈1.0 start the init is ~half the signal, so noise in the
-hole still reads as content). Decoded noise (a random latent through the VAE
-decode) is on-manifold and re-encodes cleanly.
+nothing there. Decoded noise (a random latent through the VAE decode) is
+on-manifold and re-encodes cleanly.
+
+**Why the hole's content matters even though sampling starts from noise.** LTX is
+flow-matching: at σ = 1.0 the init contributes *exactly zero* to the first step.
+The init is not consumed once — ComfyUI **re-blends it on every step wherever the
+mask is below 1.0** (`x = x*mask + init*(1−mask)`, and the same again on the
+output). So a cell at 0.9 has the source re-injected a dozen times across the
+schedule. Everything about masked removal follows from that: the mask must reach a
+hard **1.0** across the hole, or the thing you deleted seeps back in.
+
+That is also why the pixel→latent mask is downsampled with **max**, not bilinear.
+Bilinear point-samples a 32× reduction: the boundary ring reads ~0 (pinned to the
+init — a grey ring at the mask edge once the hole is noise-filled) and thin
+features come out fractional. Max marks a latent cell if the subject touches it at
+all, matching the temporal reduction.
 
 - **Keep the removal tight; grow+blur only the denoise mask** (KJ GrowMaskWithBlur,
   `expand ≥ blur_radius` — if the blur reaches into the tight hole it drops the

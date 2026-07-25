@@ -151,7 +151,9 @@ Latent-space **outpaint** prep for the base-model path (no LoRA, no fill color).
 ### Subject removal — LTX Removal Encode (+ Noise Fill, Inpaint Latent)
 Removing a subject from a shot **cannot** be done by zeroing latent cells — the VAE encoder already spreads the subject ~32px past its silhouette into the *kept* cells, and the decoder pulls those back into the hole, so it reconstructs exactly. **Removal has to happen in pixel space, before the encode.**
 
-**LTX Removal Encode** does the whole validated recipe in one node: tight pixel noise-fill → VAE encode → latent zero, on one mask, with the dialed-in values locked (grow/feather 0, decoded noise @ 0.1, fixed seed). Two cleans, both needed: the pixel noise-fill removes the subject from the source so it's gone from the latent *everywhere* (the kept cells the latent-zero can't reach), and the latent-zero empties the hole so the model reads nothing there (at the sigma≈1.0 start the init is ~half the signal — noise still reads as content).
+**LTX Removal Encode** does the whole validated recipe in one node: tight pixel noise-fill → VAE encode → latent zero, on one mask, with the dialed-in values locked (grow/feather 0, decoded noise @ 0.1, fixed seed). Two cleans, both needed: the pixel noise-fill removes the subject from the source so it's gone from the latent *everywhere* (the kept cells the latent-zero can't reach), and the latent-zero empties the hole so the model reads nothing there.
+
+Why the hole's content matters at all, given the sampler starts from noise: LTX is flow-matching, so at σ = 1.0 the init contributes *nothing* to the first step — but ComfyUI **re-blends the init on every step wherever the mask is below 1.0** (`x = x*mask + init*(1−mask)`, and the same on the output). So any cell that isn't a hard 1.0 has the source re-injected a dozen times across the schedule. That is also why the mask's latent-grid coverage is downsampled with **max** rather than bilinear — bilinear point-samples a 32× reduction and drops the whole boundary ring to ~0, which pins those cells to the init and shows up as a grey ring at the mask edge.
 
 | Input | Default | Description |
 |---|---|---|

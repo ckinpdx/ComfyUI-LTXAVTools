@@ -93,6 +93,23 @@
   chunked long-form pixel upscaling. Factor 1 = unchanged dense references.
 
 ### Fixed
+- **Mask → latent downsampling now uses max, not bilinear** (2026-07-24): the
+  shared `ltx_mask_to_latent` reduced the temporal axis with max but the 32×
+  *spatial* axis with bilinear — wrong for a coverage mask. Bilinear
+  point-samples that reduction, so a solid region covered 77 latent cells where
+  max covers 91 (the whole boundary ring read ~0 and was silently treated as
+  KEEP → pinned to the init → a grey ring at the mask edge once the hole is
+  noise-filled), and thin features came out ~50% fractional (any cell below 1.0
+  has the init re-blended into it on *every* sampling step, per
+  `samplers.py:637-641`). Now `adaptive_max_pool2d`: a latent cell is masked if
+  the subject touches it at all. Fixes both the latent-zero nodes and the
+  sampler's `optional_denoise_mask` in one place.
+- **Docs correction — flow-matching init semantics**: earlier notes claimed the
+  init is "~half the signal at σ≈1.0". That is the eps-model formula; LTX is
+  flow-matching (`model_sampling.py:97`, `sigma*noise + (1-sigma)*latent_image`)
+  so at σ = 1.0 the init contributes exactly zero. The init matters because it
+  is re-blended every step wherever the denoise mask is below 1.0 — same
+  conclusion (zero the hole), correct reason.
 - **Streaming Video Encode: frame resampler now duplicates as well as drops**
   (2026-07-24): the old accumulator only decimated (force_rate < native), so
   for the upsample case (24 → 25) it passed native frames through 1:1 and
