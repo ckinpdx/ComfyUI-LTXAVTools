@@ -3,6 +3,25 @@
 ## 1.1.0 — 2026-07-15
 
 ### Added
+- **Subject removal nodes** (2026-07-24, validated on basic scenes):
+  - **LTX Removal Encode** — one-node prep: tight pixel noise-fill → VAE encode
+    → latent zero, on one mask, with the recipe locked (grow/feather 0, decoded
+    noise @ 0.1, fixed seed; only `temporal_mode` exposed). Output `(latent,
+    mask)` → concat audio to `latents`, grow+blur the mask to
+    `optional_denoise_mask`.
+  - **LTX Noise Fill** — the pixel-space step alone: composites VAE-decoded
+    (on-manifold) or gaussian noise into the masked region *before* encoding,
+    so the subject is gone from the latent entirely and the VAE can't smear it
+    from kept cells back into the hole. (The latent-zero-only path,
+    **LTX Inpaint Latent**, leaks for removal because the encode already
+    carried and smeared the subject — use it for in-place edits, not removal.)
+  - **Mask `temporal_mode`** on LTX Inpaint Latent / LTX Removal Encode, and
+    **`denoise_mask_temporal_mode`** on the AV Looping Sampler (match them):
+    how per-frame masks reduce onto the 8:1 latent grid — `max` (union, safe,
+    blobs at cuts), `last` (causal-aligned crisp, best across cuts),
+    `mean_threshold`, `min`. Known limit: the VAE blends two contexts into one
+    latent frame at a cut/fast motion, which no mask mode can un-blend
+    (per-shot encode is the real cure, not yet built).
 - **LTX Video Outpaint Latent** (2026-07-24, validated): latent-space outpaint
   prep for the base-model path — zero-pads an encoded video latent (real
   centre, **zero margin**) + emits a feathered denoise mask. The zero margin

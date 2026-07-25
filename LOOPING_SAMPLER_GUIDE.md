@@ -249,6 +249,35 @@ regenerates it cleanly. **No LoRA, no fill color, no green rim.**
   moving-camera shots (motion feeds the margin over time) and simple margins (sky, wall,
   bokeh); large static extensions run out of context at the frame edge — LoRA territory.
 
+### Subject removal — pixel space, not latent (`LTX Removal Encode`)
+
+Removing someone is **not** inpaint-with-a-mask. Zeroing latent cells leaks: the
+VAE encoder already smeared the subject ~32px past its silhouette into the *kept*
+cells, and the decoder pulls them back into the hole, so it reconstructs exactly
+(the give-away is the subject returning *identically* even with an empty prompt
+and no guide). Removal must happen in **pixel space, before the encode**.
+
+`LTX Removal Encode` bundles the working recipe: tight pixel **noise-fill** →
+VAE encode → **latent zero**. Both cleans are required — the noise-fill deletes
+the subject from the source so it's gone from the latent everywhere (the kept
+cells the zero can't reach), and the zero empties the hole so the model reads
+nothing there (at a sigma≈1.0 start the init is ~half the signal, so noise in the
+hole still reads as content). Decoded noise (a random latent through the VAE
+decode) is on-manifold and re-encodes cleanly.
+
+- **Keep the removal tight; grow+blur only the denoise mask** (KJ GrowMaskWithBlur,
+  `expand ≥ blur_radius` — if the blur reaches into the tight hole it drops the
+  mask below 1 there and the fill-noise survives as a **gray blob**). The grown
+  denoise mask regenerates the encoder's smear margin and blends the seam.
+- **`temporal_mode`** (match it between the removal node and the sampler's
+  `denoise_mask_temporal_mode`): per-frame masks reduce onto the 8:1 latent grid —
+  `last` is causal-aligned and crisp (best across cuts), `max` unions and blobs at
+  cuts, `min`/`mean_threshold` collapse across a cut.
+- **Hard limit:** at a cut or fast motion the VAE blends two contexts into one
+  latent frame — no mask mode un-blends that, so expect residual bleed there. The
+  real cure is a per-shot encode (VAE never spans a cut); not yet built. Working
+  envelope: single-context scenes / clean cuts.
+
 ### When the IC-LoRA route still wins (the fallback)
 
 Reach for **LTX Inpaint Color Fill** + an inpaint IC-LoRA (guide + `guiding_downscale_factor`

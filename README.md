@@ -148,6 +148,22 @@ Latent-space **outpaint** prep for the base-model path (no LoRA, no fill color).
 
 **Outputs:** `latent` (zero-padded video), `denoise_mask` (feathered). Wire `latent` (after `LTXVConcatAVLatent` with your audio) → sampler `latents`, and `denoise_mask` → `optional_denoise_mask`. Prompt describes the extended scene (no LoRA prior). Fixes the black-artifact failure, not the one-sided-context limit — strongest on moving-camera / simple margins; large static extensions are where the outpaint IC-LoRA (Inpaint Color Fill + guide) still has a role.
 
+### Subject removal — LTX Removal Encode (+ Noise Fill, Inpaint Latent)
+Removing a subject from a shot **cannot** be done by zeroing latent cells — the VAE encoder already spreads the subject ~32px past its silhouette into the *kept* cells, and the decoder pulls those back into the hole, so it reconstructs exactly. **Removal has to happen in pixel space, before the encode.**
+
+**LTX Removal Encode** does the whole validated recipe in one node: tight pixel noise-fill → VAE encode → latent zero, on one mask, with the dialed-in values locked (grow/feather 0, decoded noise @ 0.1, fixed seed). Two cleans, both needed: the pixel noise-fill removes the subject from the source so it's gone from the latent *everywhere* (the kept cells the latent-zero can't reach), and the latent-zero empties the hole so the model reads nothing there (at the sigma≈1.0 start the init is ~half the signal — noise still reads as content).
+
+| Input | Default | Description |
+|---|---|---|
+| `images` / `mask` / `vae` | — | Source frames, tight SAM mask, video VAE |
+| `temporal_mode` | last | Per-frame mask → 8:1 latent grid: `last` (causal-aligned crisp, best across cuts), `max` (union, blobs at cuts), `mean_threshold`, `min`. **Match the sampler's `denoise_mask_temporal_mode`.** |
+
+**Outputs:** `latent`, `mask`. Wire `latent` (concat audio) → sampler `latents`; **grow+blur** the `mask` (KJ GrowMaskWithBlur, `expand ≥ blur_radius` or the blur eats the hole → gray blob) → `optional_denoise_mask`. Keep the mask tight on this node — grow lives only on the denoise side.
+
+Related pieces (exposed for hand-tuning the hard cases): **LTX Noise Fill** (the pixel-fill step alone, `decoded`/`gaussian` noise) and **LTX Inpaint Latent** (latent-zero alone — *leaks for removal*; use for in-place edits where the source *should* influence, not removal).
+
+> **Known limit:** at a cut or fast motion the VAE blends two contexts into one latent frame, which no `temporal_mode` can un-blend — expect residual bleed there. The real cure is a per-shot encode (VAE never spans a cut), not yet built. Working envelope: single-context scenes / clean cuts.
+
 ### LTX Audio Latent Trim
 Trims a 4D audio latent `[B, C, T, F]` along the temporal axis. Supports negative indexing. Used to extract context and output windows in sliding-window loops.
 
