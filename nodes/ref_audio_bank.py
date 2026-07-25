@@ -15,6 +15,7 @@ discontinuity because the new region is generated following the ref's tail
 but spliced after the accumulator's real tail.
 """
 
+import torch
 import torchaudio
 
 
@@ -26,6 +27,21 @@ def _encode_ref_latent(audio_vae, reference_audio):
     if vae_sample_rate != sample_rate:
         waveform = torchaudio.functional.resample(waveform, sample_rate, vae_sample_rate)
     return audio_vae.encode(waveform.movedim(1, -1))
+
+
+def _silence_latent(audio_vae, n_frames, like_waveform):
+    """N frames of VAE-encoded real silence [B, C, N, F] — NOT a zero latent
+    (zeros are OOD for a2v attention and decode to a faint hum). Encodes a
+    zero WAVEFORM and takes a stable interior slice (avoids the encoder's
+    edge frames). Channels/format match the reference waveform."""
+    sr = getattr(audio_vae, "audio_sample_rate", 44100)
+    channels = like_waveform.shape[1]
+    samples = max(1, int(round(((n_frames + 8) / 25.0) * sr)))
+    wav = torch.zeros(1, channels, samples, dtype=torch.float32)
+    lat = audio_vae.encode(wav.movedim(1, -1))
+    if lat.shape[2] >= n_frames + 4:
+        return lat[:, :, 4:4 + n_frames, :].contiguous()
+    return lat[:, :, :n_frames, :].contiguous()
 
 
 class LTXAVReferenceAudioBank:
@@ -59,6 +75,18 @@ class LTXAVReferenceAudioBank:
                                "in a scripted gap, since a mid-speech swap causes an "
                                "output discontinuity at the splice.",
                 }),
+                "trailing_silence_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 64,
+                    "tooltip": "Latent frames of VAE-encoded silence the sampler "
+                               "places at the END of the swapped carry: the ref voice "
+                               "sits at the front (identity established), the last N "
+                               "frames are quiet so the new region onsets from silence "
+                               "instead of continuing a mid-word ref tail. 0 = off "
+                               "(carry is the ref's front only). ~1-3 frames (~40-120ms) "
+                               "is a clean seam; more silence weakens transfer. Applied "
+                               "in the sampler where the overlap length is known, so it "
+                               "works regardless of ref length.",
+                }),
             },
             "optional": {
                 "reference_audio_2": ("AUDIO",),
@@ -80,6 +108,7 @@ class LTXAVReferenceAudioBank:
     )
 
     def build(self, audio_vae, reference_audio_1, schedule, swap_mode,
+              trailing_silence_frames=0,
               reference_audio_2=None, reference_audio_3=None, reference_audio_4=None):
 
         latents = {}
@@ -112,9 +141,22 @@ class LTXAVReferenceAudioBank:
         if not parsed:
             parsed = [1]
 
+        trailing_silence = None
+        n_sil = max(0, int(trailing_silence_frames))
+        if n_sil > 0:
+            trailing_silence = _silence_latent(
+                audio_vae, n_sil, reference_audio_1["waveform"])
+            print(f"[LTXAVReferenceAudioBank] trailing silence: {n_sil} frames "
+                  f"(~{n_sil / 25.0 * 1000:.0f}ms) appended to each swapped carry tail")
+
         print(f"[LTXAVReferenceAudioBank] schedule: {parsed} | swap_mode: {swap_mode}")
 
-        return ({"latents": latents, "schedule": parsed, "swap_mode": swap_mode},)
+        return ({
+            "latents": latents,
+            "schedule": parsed,
+            "swap_mode": swap_mode,
+            "trailing_silence": trailing_silence,
+        },)
 
 
 NODE_CLASS_MAPPINGS = {
