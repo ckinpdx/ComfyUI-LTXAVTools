@@ -29,6 +29,8 @@ from comfy_extras.nodes_lt import (
     get_noise_mask,
 )
 
+from .utils import ltx_mask_to_latent
+
 AUDIO_LATENTS_PER_SECOND = 25.0
 
 
@@ -329,6 +331,15 @@ class LTXVAVLoopingSampler:
                                "directly). Merged keep-wins (elementwise min) with "
                                "video_cond_strength / overlap / keyframe masks.",
                 }),
+                "denoise_mask_temporal_mode": (["max", "last", "mean_threshold", "min"], {
+                    "default": "max",
+                    "tooltip": "How optional_denoise_mask reduces per-frame masks onto "
+                               "the 8:1 latent grid. max = union (safe, blobs at "
+                               "cuts/motion); last = the group's last frame (causal-"
+                               "aligned, crisp); mean_threshold = middle; min = "
+                               "intersection. Match this to LTX Inpaint Latent's "
+                               "temporal_mode. Try 'last' for gray blobs at view changes.",
+                }),
             },
         }
 
@@ -444,34 +455,18 @@ class LTXVAVLoopingSampler:
         return NestedTensor(ltxav.recombine_audio_and_video_latents(vm, audio_mask_tensor))
 
     @staticmethod
-    def _prepare_spatial_mask(mask, T_lat, lat_h, lat_w):
+    def _prepare_spatial_mask(mask, T_lat, lat_h, lat_w, mode="max"):
         """MASK (white = regenerate, black = keep) -> [1,1,T_lat,h,w] denoise
-        mask on the latent grid. A single-frame mask is static; multi-frame
-        masks are resampled temporally (per-pixel-frame masks land on the
-        8-frame latent grid via trilinear averaging)."""
-        m = mask.float()
-        if m.ndim == 2:
-            m = m.unsqueeze(0)                                    # [1,H,W]
-        elif m.ndim == 4:
-            m = m.squeeze(1) if m.shape[1] == 1 else m[0]
-        m = m.clamp(0.0, 1.0)[None, None]                         # [1,1,N,H,W]
-        N = m.shape[2]
-        if N == 1:
-            m = torch.nn.functional.interpolate(
-                m[:, :, 0], size=(lat_h, lat_w),
-                mode="bilinear", align_corners=False,
-            )[:, :, None].expand(-1, -1, T_lat, -1, -1).contiguous()
-        else:
-            px_expected = (T_lat - 1) * 8 + 1
-            if N not in (T_lat, px_expected):
-                print(f"[LTXVAVLoopingSampler] denoise mask has {N} frames; "
-                      f"expected {px_expected} pixel frames or {T_lat} latent "
-                      f"frames — resampling temporally.")
-            m = torch.nn.functional.interpolate(
-                m, size=(T_lat, lat_h, lat_w),
-                mode="trilinear", align_corners=False,
-            )
-        return m
+        mask on the latent grid. Single frame = static; multi-frame masks
+        reduce temporally per `mode` over each latent frame's 8-pixel-frame
+        group (see ltx_mask_to_latent). Spatial = bilinear."""
+        N = mask.shape[0] if mask.ndim == 3 else (mask.shape[0] if mask.ndim == 4 else 1)
+        px_expected = (T_lat - 1) * 8 + 1
+        if N not in (1, T_lat, px_expected):
+            print(f"[LTXVAVLoopingSampler] denoise mask has {N} frames; expected "
+                  f"{px_expected} pixel frames or {T_lat} latent frames — "
+                  f"normalizing to the pixel grid (nearest) before grouping.")
+        return ltx_mask_to_latent(mask, T_lat, lat_h, lat_w, mode=mode)
 
     @staticmethod
     def _merge_video_mask(video_init, m):
@@ -746,6 +741,21 @@ class LTXVAVLoopingSampler:
         # Spatial keep-mask: merged BEFORE guide additions (mask must match the
         # pre-token temporal length); keep always wins over the scalar masks.
         if spatial_mask is not None:
+            # DIAGNOSTIC: what is the init actually holding under the mask? If
+            # the region was zeroed upstream this is ~0; a nonzero value means
+            # the sampler's init still carries the original content there (the
+            # zeroed latent isn't what reached `latents`).
+            sm = spatial_mask[:, :, :T_v].to(video_init["samples"].device)
+            reg = (sm > 0.5)  # regenerate region
+            si = video_init["samples"]
+            if reg.any():
+                reg_b = reg.expand_as(si)
+                masked_mag = float(si[reg_b].abs().mean())
+                kept_mag = float(si[~reg_b].abs().mean()) if (~reg_b).any() else 0.0
+                print(f"[LTXVAVLoopingSampler] DIAG init |x| in REGEN region: "
+                      f"{masked_mag:.4f} | in KEEP region: {kept_mag:.4f} — "
+                      f"regen should be ~0 if the latent was zeroed; nonzero "
+                      f"means the ORIGINAL content is the sampler's init there.")
             self._merge_video_mask(video_init, spatial_mask[:, :, :T_v])
 
         # guiding latents (IC-LoRA) — first chunk starts at latent_idx 0
@@ -842,6 +852,7 @@ class LTXVAVLoopingSampler:
         adain_factor=0.0, adain_ref=None, adain_per_frame=False,
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         ref_audio_swap=None,
+        ref_trailing_silence=None,
         guiding_downscale_factor=1,
         spatial_mask=None,
     ):
@@ -996,11 +1007,25 @@ class LTXVAVLoopingSampler:
                       f"the context.")
                 ref = ref.repeat(1, 1, reps, 1)
             audio_carry = ref[:, :, :a_overlap, :].clone()
+            # Trailing silence (bank's trailing_silence_frames): keep the ref
+            # voice at the FRONT (identity) and quiet the last N frames so the
+            # new region onsets from silence instead of continuing a mid-word
+            # ref tail. Length stays a_overlap. Kept >= 1 voice frame.
+            sil_note = ""
+            if (ref_trailing_silence is not None and ref_trailing_silence.shape[2] > 0
+                    and a_overlap > 1):
+                n_sil = min(int(ref_trailing_silence.shape[2]), a_overlap - 1)
+                sil = ref_trailing_silence.to(device=dev, dtype=dty)[:, :, :n_sil, :]
+                if sil.shape[0] != audio_carry.shape[0]:
+                    sil = sil.expand(audio_carry.shape[0], -1, -1, -1)
+                audio_carry = torch.cat(
+                    [audio_carry[:, :, :a_overlap - n_sil, :], sil], dim=2)
+                sil_note = f", {n_sil}f trailing silence"
             if audio_carry.shape[0] != audio_acc.shape[0]:
                 audio_carry = audio_carry.expand(audio_acc.shape[0], -1, -1, -1).clone()
             print(f"[LTXVAVLoopingSampler] chunk {chunk_index}: audio carry swapped "
                   f"to reference voice ({a_overlap} frames, ~{a_overlap / 25.0:.2f}s "
-                  f"of context). Real tail preserved in output.")
+                  f"of context{sil_note}). Real tail preserved in output.")
         else:
             audio_carry = audio_acc[:, :, -a_overlap:, :].clone()
 
@@ -1264,6 +1289,8 @@ class LTXVAVLoopingSampler:
                     chunk_index=chunk_idx,
                     adain_ref=chunk_adain_ref, adain_per_frame=adain_per_frame,
                     ref_audio_swap=ref_audio_swap,
+                    ref_trailing_silence=(ref_bank.get("trailing_silence")
+                                          if ref_bank is not None else None),
                 )
             chunk_idx += 1
 
@@ -1300,6 +1327,7 @@ class LTXVAVLoopingSampler:
         guiding_downscale_factor=1.0,
         video_cond_strength=0.0,
         optional_denoise_mask=None,
+        denoise_mask_temporal_mode="max",
     ):
         # Accepts the FLOAT latent_downscale_factor output of LTX IC-LoRA
         # Loader Model Only (metadata-driven); integer factor internally.
@@ -1478,7 +1506,8 @@ class LTXVAVLoopingSampler:
         spatial_mask_full = None
         if optional_denoise_mask is not None:
             spatial_mask_full = self._prepare_spatial_mask(
-                optional_denoise_mask, frames, height, width)
+                optional_denoise_mask, frames, height, width,
+                mode=denoise_mask_temporal_mode)
             kept = float((spatial_mask_full < 0.5).float().mean())
             print(f"[LTXVAVLoopingSampler] denoise mask active: "
                   f"{kept * 100:.1f}% of the latent grid kept (pinned to input).")
