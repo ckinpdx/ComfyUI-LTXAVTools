@@ -29,9 +29,10 @@ from comfy_extras.nodes_lt import (
     get_noise_mask,
 )
 
-from .utils import ltx_mask_to_latent
-
-AUDIO_LATENTS_PER_SECOND = 25.0
+# audio_pos is the global audio boundary map (SPEC_50FPS); imported now so the
+# rate constant has one definition. Current call sites still use the local
+# chunk-span helpers below — swapping them over is the 50 fps refactor itself.
+from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos, ltx_mask_to_latent  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,10 @@ import torch
 import comfy.model_management
 from comfy.nested_tensor import NestedTensor
 
+# audio_pos is unused until the SPEC_50FPS refactor lands; imported here so the
+# constant has exactly one definition (see utils.audio_pos).
+from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos  # noqa: F401
+
 
 _LTX_VIDEO_LATENT_CHANNELS = 128
 _LTX_MIN_VIDEO_SPATIAL = 4  # latent space (= 32px), safe minimum for patchifier
@@ -156,7 +160,7 @@ class LTXAVExtendLatent:
     so the model has a hard visual anchor to continue from.
     """
 
-    _AUDIO_LATENTS_PER_SECOND = 25.0
+    _AUDIO_LATENTS_PER_SECOND = AUDIO_LATENTS_PER_SECOND  # shared (utils)
 
     @classmethod
     def INPUT_TYPES(s):

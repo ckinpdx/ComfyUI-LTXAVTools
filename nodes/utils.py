@@ -13,6 +13,37 @@ except ImportError:
     _HAS_NESTED = False
 
 
+AUDIO_LATENTS_PER_SECOND = 25.0
+
+
+def audio_pos(n_latents, fps):
+    """Audio latents covering video latents [0, n) — the GLOBAL boundary map.
+
+    Every audio count should be a DIFFERENCE of two audio_pos values, never a
+    chunk-local span. Closed form, for q = 200/fps and n >= 1:
+
+        audio_pos(n) = (n - 1) * q + floor(q/8 + 0.5)
+
+    When q is an integer (fps divides 200), (n-1)*q factors straight out of the
+    rounding, so the rounding term is a CONSTANT and cancels in any difference:
+
+        audio_pos(n) - audio_pos(m) = (n - m) * q     exactly, for n > m >= 1
+
+    A chunk-LOCAL span instead re-introduces LTX's first-frame asymmetry
+    (latent 0 = 1 pixel frame) at every chunk; at 50 fps that lands on exactly
+    x.5 and rounds by parity, giving +-1 audio frame per boundary, cumulative.
+    See SPEC_50FPS.md.
+
+    Half-up rounding — never Python round(), whose banker's rounding is
+    parity-dependent. Exact in float64 for every valid fps: fps | 200 = 2^3*5^2
+    forces 25/fps = 5^(2-b)/2^a, a dyadic rational.
+    """
+    if n_latents <= 0:
+        return 0
+    px = (n_latents - 1) * 8 + 1
+    return int(px * AUDIO_LATENTS_PER_SECOND / fps + 0.5)
+
+
 def ltx_mask_to_latent(m, T, lat_h, lat_w, mode="max"):
     """Pixel MASK -> [1,1,T,lat_h,lat_w] on the LTX latent grid.
 
@@ -115,7 +146,7 @@ class LTXAVLatentCheck:
     this equals frame_count exactly).
     """
 
-    AUDIO_LATENTS_PER_SECOND = 25.0
+    AUDIO_LATENTS_PER_SECOND = AUDIO_LATENTS_PER_SECOND  # module constant
 
     @classmethod
     def INPUT_TYPES(s):
@@ -168,7 +199,7 @@ class LTXAVSeparateCheck:
     Place after trim operations to verify video and audio are still in sync.
     """
 
-    AUDIO_LATENTS_PER_SECOND = 25.0
+    AUDIO_LATENTS_PER_SECOND = AUDIO_LATENTS_PER_SECOND  # module constant
 
     @classmethod
     def INPUT_TYPES(s):
@@ -715,8 +746,118 @@ class LTXAVStreamingSave:
                     "tooltip": "Decoded audio (LTXVAudioVAEDecode) to mux into "
                                "the file. Omit for silent video.",
                 }),
+                "video_encoder": (["auto", "libx264", "h264_nvenc",
+                                   "libopenh264", "mpeg4"], {
+                    "default": "auto",
+                    "tooltip": "auto = probe the binary and take the first "
+                               "available in preference order (libx264 → "
+                               "h264_nvenc → libopenh264 → mpeg4). Pick one "
+                               "explicitly if auto guesses wrong. Quality maps "
+                               "per encoder: crf (x264) / cq (nvenc) / bitrate "
+                               "(openh264) / qscale (mpeg4).",
+                }),
+                "ffmpeg_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Override the ffmpeg binary. Empty = search the "
+                               "explicit path, then PATH, then imageio-ffmpeg, "
+                               "and use the first one that actually has a "
+                               "working H.264 encoder (a PATH ffmpeg built "
+                               "without libx264 is the usual culprit).",
+                }),
             },
         }
+
+    # --- ffmpeg capability handling -------------------------------------
+    # Each entry: (encoder name, builder(crf, w, h) -> arg list). -preset and
+    # -crf are x264-specific, so every encoder needs its own quality mapping.
+    @staticmethod
+    def _encoder_args(name, crf, w, h):
+        if name == "libx264":
+            return ["-c:v", "libx264", "-preset", "medium",
+                    "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        if name == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr",
+                    "-cq", str(crf), "-pix_fmt", "yuv420p"]
+        if name == "libopenh264":
+            # no CRF support — approximate from crf and frame area
+            mbps = max(1.0, (w * h / (1280 * 720)) * (2.0 ** ((28 - crf) / 6.0)))
+            return ["-c:v", "libopenh264", "-b:v", f"{mbps:.1f}M",
+                    "-pix_fmt", "yuv420p"]
+        # mpeg4: qscale 1(best)-31(worst)
+        return ["-c:v", "mpeg4", "-q:v", str(max(1, min(31, crf // 2))),
+                "-pix_fmt", "yuv420p"]
+
+    _ENCODER_PREFERENCE = ["libx264", "h264_nvenc", "libopenh264", "mpeg4"]
+    _probe_cache = {}
+
+    @classmethod
+    def _available_encoders(cls, ffmpeg):
+        """Encoders this binary can actually use (cached per binary path)."""
+        if ffmpeg in cls._probe_cache:
+            return cls._probe_cache[ffmpeg]
+        import subprocess
+        found = set()
+        try:
+            out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                 capture_output=True, timeout=30)
+            text = (out.stdout or b"").decode("utf-8", "replace")
+            for enc in cls._ENCODER_PREFERENCE:
+                # lines look like " V....D libx264   libx264 H.264 ..."
+                if any(line.split()[1:2] == [enc]
+                       for line in text.splitlines() if line.strip()):
+                    found.add(enc)
+        except Exception as e:
+            # The binary could not be run at all (missing / not executable).
+            # Report NO encoders so this candidate is skipped rather than
+            # optimistically assumed good — otherwise a bad explicit path or a
+            # stale PATH entry shadows a working build.
+            print(f"[LTXAVStreamingSave] ffmpeg candidate unusable, skipping: "
+                  f"{ffmpeg} ({e})")
+            found = set()
+        cls._probe_cache[ffmpeg] = found
+        return found
+
+    @classmethod
+    def _resolve_ffmpeg(cls, explicit, want_encoder):
+        """Pick (binary, encoder). Prefers a binary that HAS a usable encoder
+        over merely the first one found — a PATH ffmpeg built without libx264
+        (conda) would otherwise shadow a working imageio-ffmpeg build."""
+        import shutil
+        candidates = []
+        if explicit and explicit.strip():
+            candidates.append(explicit.strip().strip('"'))
+        on_path = shutil.which("ffmpeg")
+        if on_path:
+            candidates.append(on_path)
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+            candidates.append(get_ffmpeg_exe())
+        except Exception:
+            pass
+        # de-dupe, keep order
+        seen, ordered = set(), []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                ordered.append(c)
+        if not ordered:
+            raise RuntimeError(
+                "[LTXAVStreamingSave] no ffmpeg found (not on PATH, "
+                "imageio-ffmpeg unavailable, no ffmpeg_path given)."
+            )
+
+        wanted = ([want_encoder] if want_encoder != "auto"
+                  else cls._ENCODER_PREFERENCE)
+        for binary in ordered:
+            have = cls._available_encoders(binary)
+            for enc in wanted:
+                if enc in have:
+                    return binary, enc
+        # nothing matched: fall back to the first binary and let ffmpeg speak
+        fallback = wanted[0]
+        print(f"[LTXAVStreamingSave] no candidate ffmpeg reported {wanted} — "
+              f"trying {ordered[0]} with {fallback} anyway.")
+        return ordered[0], fallback
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("file_path",)
@@ -731,7 +872,8 @@ class LTXAVStreamingSave:
     )
 
     def stream_save(self, latent, vae, chunk_latents, context_latents, fps,
-                    filename_prefix, crf, optional_audio=None):
+                    filename_prefix, crf, optional_audio=None,
+                    video_encoder="auto", ffmpeg_path=""):
         import os
         import shutil
         import subprocess
@@ -749,19 +891,11 @@ class LTXAVStreamingSave:
         video = video[:1]
         T = video.shape[2]
 
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            try:
-                from imageio_ffmpeg import get_ffmpeg_exe
-                ffmpeg = get_ffmpeg_exe()
-            except Exception:
-                raise RuntimeError(
-                    "[LTXAVStreamingSave] ffmpeg not found on PATH (and "
-                    "imageio-ffmpeg unavailable)."
-                )
-        # Logged so shadowed-PATH problems (conda/minimal builds without
-        # libx264) are visible in reports.
-        print(f"[LTXAVStreamingSave] using ffmpeg: {ffmpeg}")
+        # Pick a binary that actually HAS a usable encoder, not just the first
+        # one on PATH — logged so shadowed-PATH problems are visible in reports.
+        ffmpeg, encoder = self._resolve_ffmpeg(ffmpeg_path, video_encoder)
+        print(f"[LTXAVStreamingSave] using ffmpeg: {ffmpeg} | encoder: {encoder}"
+              + ("" if video_encoder == "auto" else " (forced)"))
 
         out_dir = folder_paths.get_output_directory()
         full_folder, fname, counter, subfolder, _ = folder_paths.get_save_image_path(
@@ -807,13 +941,19 @@ class LTXAVStreamingSave:
 
                 if proc is None:
                     H, W = int(px.shape[1]), int(px.shape[2])
+                    if (W % 2) or (H % 2):
+                        raise ValueError(
+                            f"[LTXAVStreamingSave] frame size {W}x{H} has an odd "
+                            f"dimension; yuv420p requires both even. LTX latents "
+                            f"are always ÷32 — a hand-cropped latent is the usual "
+                            f"cause."
+                        )
                     proc = subprocess.Popen(
                         [ffmpeg, "-y", "-loglevel", "error",
                          "-f", "rawvideo", "-pix_fmt", "rgb24",
-                         "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:",
-                         "-c:v", "libx264", "-preset", "medium",
-                         "-crf", str(crf), "-pix_fmt", "yuv420p",
-                         video_tmp],
+                         "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:"]
+                        + self._encoder_args(encoder, crf, W, H)
+                        + [video_tmp],
                         stdin=subprocess.PIPE,
                         stderr=err_file,
                     )
