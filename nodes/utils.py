@@ -13,6 +13,56 @@ except ImportError:
     _HAS_NESTED = False
 
 
+def ltx_mask_to_latent(m, T, lat_h, lat_w, mode="max"):
+    """Pixel MASK -> [1,1,T,lat_h,lat_w] on the LTX latent grid.
+
+    Each latent frame covers a group of pixel frames (LTX first-frame asymmetry:
+    latent 0 = 1 pixel frame, latents 1+ = 8). `mode` = how those frames reduce:
+      - max            : union — covers the object wherever it appears in the
+                         group (safe, but oversizes on motion; blobs at cuts).
+      - min            : intersection — only where masked in EVERY frame (crisp,
+                         under-covers on motion -> can leak).
+      - last           : the group's LAST pixel frame only — the LTX VAE is
+                         causal, so latent t aligns to pixel frame 8t. Crisp,
+                         tracks the current position, no union blob.
+      - mean_threshold : average then threshold at 0.5 — middle ground.
+    Spatial = bilinear."""
+    F = torch.nn.functional
+    if m.ndim == 2:
+        m = m.unsqueeze(0)
+    elif m.ndim == 4:
+        m = m.squeeze(1) if m.shape[1] == 1 else m[0]
+    m = m.float().clamp(0.0, 1.0)                                       # [N,H,W]
+    ms = F.interpolate(m.unsqueeze(1), size=(lat_h, lat_w),
+                       mode="bilinear", align_corners=False).squeeze(1)  # [N,lh,lw]
+    N = ms.shape[0]
+    if N == 1:
+        out = ms.expand(T, -1, -1)
+    elif N == T:
+        out = ms
+    else:
+        px = (T - 1) * 8 + 1
+        if N != px:
+            # normalize odd frame counts to the pixel grid without averaging
+            ms = F.interpolate(ms[None, None], size=(px, lat_h, lat_w),
+                               mode="nearest")[0, 0]
+
+        def _reduce(grp):  # grp: [k, lh, lw]
+            if mode == "min":
+                return grp.amin(dim=0, keepdim=True)
+            if mode == "last":
+                return grp[-1:].clone()
+            if mode == "mean_threshold":
+                return (grp.mean(dim=0, keepdim=True) > 0.5).float()
+            return grp.amax(dim=0, keepdim=True)  # max (default)
+
+        groups = [ms[0:1]]
+        for t in range(1, T):
+            groups.append(_reduce(ms[8 * (t - 1) + 1: 8 * t + 1]))
+        out = torch.cat(groups, dim=0)                                 # [T,lh,lw]
+    return out[None, None].clamp(0.0, 1.0)                             # [1,1,T,lh,lw]
+
+
 class PreviewImagePassthrough:
     """
     Displays a preview of the input image and passes it through unchanged.
@@ -1323,6 +1373,329 @@ class LTXVideoOutpaintLatent:
         return ({"samples": v_pad}, mask)
 
 
+class LTXNoiseFill:
+    """
+    Pixel-space removal fill: composites noise into the masked region of a
+    video BEFORE encoding. Removing the subject in *pixels* (not latent cells)
+    means it's gone from the latent everywhere — so the VAE can't smear it from
+    kept cells back into the hole, which is what leaks with latent-space
+    zeroing. Noise (vs a solid fill) is unstructured, so the encoder spreads
+    noise, not content, and the model regenerates the hole fresh instead of
+    anchoring to prior pixels.
+
+    `noise_mode`:
+      - decoded: a random latent run through the VAE decode → on-manifold noise
+        pixels that re-encode to clean latent noise (one VAE decode; the cost).
+      - gaussian: cheap per-frame pixel noise, no decode (use if decoded is too
+        heavy — slightly off-manifold for the encoder but usually fine).
+
+    Feed the output IMAGE to your normal VAE encode → sampler `latents`, and the
+    returned MASK to optional_denoise_mask. HARD mask + small grow (no feather)
+    so the hole covers the encoder's ~32px spread. Everything runs on the GPU.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",),
+                "vae": ("VAE",),
+                "noise_mode": (["decoded", "gaussian"], {"default": "decoded"}),
+            },
+            "optional": {
+                "grow": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Keep at 0 — the removal should be TIGHT. Grow "
+                               "belongs on the DENOISE mask instead (GrowMaskWithBlur "
+                               "right before the sampler): grow+blur the regenerate "
+                               "region to cover the VAE's ~32px smear and blend the "
+                               "seam, while the fill stays precise. Separable GPU dilate "
+                               "if you do use it.",
+                }),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
+                "noise_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1,
+                    "tooltip": "Std of the random latent (decoded mode) — 1.0 ~ "
+                               "encoded-content scale.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION     = "fill"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Composite noise into a masked region in PIXEL space before encoding, "
+        "so the subject is gone from the latent entirely (no VAE smear/leak). "
+        "The correct removal prep — wire IMAGE → your VAE encode, MASK → "
+        "optional_denoise_mask."
+    )
+
+    def fill(self, images, mask, vae, noise_mode="decoded",
+             grow=32, seed=0, noise_scale=1.0):
+        F = torch.nn.functional
+        dev = model_management.get_torch_device()
+        imgs = images.to(dev)                                # [N,H,W,3]
+        N, H, W, _ = imgs.shape
+
+        # mask -> [N,H,W] on GPU, spatial-matched, grown, hard
+        m = mask.to(dev).float()
+        if m.ndim == 2:
+            m = m.unsqueeze(0)
+        elif m.ndim == 4:
+            m = m.squeeze(1) if m.shape[1] == 1 else m[0]
+        m = m.clamp(0.0, 1.0)
+        if m.shape[0] == 1 and N > 1:
+            m = m.expand(N, -1, -1)
+        if m.shape[1] != H or m.shape[2] != W:
+            m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
+        if grow > 0:
+            k = grow * 2 + 1
+            mm = m.unsqueeze(1)
+            mm = F.max_pool2d(mm, (k, 1), stride=1, padding=(grow, 0))
+            mm = F.max_pool2d(mm, (1, k), stride=1, padding=(0, grow))
+            m = mm.squeeze(1)
+        m = (m > 0.5).float()                                # hard
+
+        # noise pixels [N,H,W,3] on GPU
+        g = torch.Generator(device=dev).manual_seed(int(seed))
+        if noise_mode == "decoded":
+            lat_c = getattr(vae, "latent_channels", 128)
+            T_lat = (N - 1) // 8 + 1
+            H_lat = max(1, round(H / 32))
+            W_lat = max(1, round(W / 32))
+            z = torch.randn(1, lat_c, T_lat, H_lat, W_lat,
+                            generator=g, device=dev) * noise_scale
+            noise_px = vae.decode(z)
+            if isinstance(noise_px, tuple):
+                noise_px = noise_px[0]
+            if noise_px.ndim == 5:
+                noise_px = noise_px.reshape(-1, *noise_px.shape[-3:])  # [frames,H,W,3]
+            noise_px = noise_px.to(dev).clamp(0.0, 1.0)[:N]
+            if noise_px.shape[1] != H or noise_px.shape[2] != W:
+                noise_px = F.interpolate(noise_px.movedim(-1, 1), size=(H, W),
+                                         mode="bilinear", align_corners=False).movedim(1, -1)
+            if noise_px.shape[0] < N:  # short decode safety
+                reps = -(-N // noise_px.shape[0])
+                noise_px = noise_px.repeat(reps, 1, 1, 1)[:N]
+        else:  # gaussian
+            noise_px = (0.5 + 0.18 * torch.randn(N, H, W, 3, generator=g, device=dev)).clamp(0.0, 1.0)
+
+        m4 = m.unsqueeze(-1)
+        out = imgs * (1.0 - m4) + noise_px * m4
+        print(f"[LTXNoiseFill] {W}x{H}x{N}: filled {float(m.mean()) * 100:.1f}% with "
+              f"{noise_mode} noise (grow {grow}px). Encode this, mask -> "
+              f"optional_denoise_mask.")
+        return (out, m)
+
+
+class LTXInpaintLatent:
+    """
+    Interior counterpart to LTXVideoOutpaintLatent: zeros the MASKED region of
+    an encoded video latent (real content outside, EMPTY inside) and emits the
+    matching denoise mask. Same empty-latent principle as outpaint — a zero
+    region is nothing to preserve, so the masked area regenerates cleanly from
+    the surrounding scene + prompt, with none of the structured 'ghost' of the
+    removed content that masking over real latent can leave.
+
+    Use for REMOVAL / full replacement (no trace of the original wanted). For
+    in-place edits (recolor / restyle, where the original structure is the base
+    you're modifying) feed the real latent + optional_denoise_mask instead —
+    zeroing throws away the structure you're editing.
+
+    Zeroing is proportional to the (grown/feathered) mask — latent × (1 − mask)
+    — so the feather boundary fades empty→real in step with the denoise mask.
+    Wire latent → sampler `latents` (after concatenating audio), denoise_mask →
+    optional_denoise_mask.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples": ("LATENT", {
+                    "tooltip": "Encoded VIDEO latent (5D [B,C,T,H,W]) — not an AV "
+                               "NestedTensor. Separate video, inpaint, re-concat audio.",
+                }),
+                "mask": ("MASK", {
+                    "tooltip": "White = remove/regenerate, black = keep. Single frame "
+                               "is static; a batch (e.g. SAM per-frame) is resampled "
+                               "onto the latent grid.",
+                }),
+            },
+            "optional": {
+                "grow": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Dilate the mask (px) — expand the removal region to "
+                               "cover the object's edge, contact shadow, etc.",
+                }),
+                "feather": ("INT", {
+                    "default": 16, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Soften the mask boundary (px) so the zeroing and the "
+                               "denoise fade empty→real across it. Applied to the same "
+                               "mask used for both, so they stay consistent.",
+                }),
+                "invert": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Invert: keep the masked region, regenerate the rest.",
+                }),
+                "temporal_mode": (["max", "last", "mean_threshold", "min"], {
+                    "default": "max",
+                    "tooltip": "How the per-frame mask reduces onto the 8:1 latent "
+                               "grid. max = union (safe, blobs at cuts/motion); last "
+                               "= the group's last frame (causal-aligned, crisp); "
+                               "mean_threshold = middle; min = intersection. Try "
+                               "'last' if you get gray blobs at view changes.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "MASK")
+    RETURN_NAMES = ("latent", "denoise_mask")
+    FUNCTION     = "inpaint"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Zeros a masked region of an encoded video latent (empty inside, real "
+        "outside) + emits the feathered denoise mask, for base-model removal "
+        "inpaint. The empty region regenerates without a ghost of the removed "
+        "content. No LoRA. Interior mirror of LTX Video Outpaint Latent."
+    )
+
+    @staticmethod
+    def _gaussian_blur(m, radius):
+        sigma = max(0.5, radius / 2.0)
+        x = torch.arange(radius * 2 + 1, dtype=torch.float32) - radius
+        k = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+        k = (k / k.sum()).to(m.device, m.dtype)
+        mm = m.unsqueeze(1)  # [N,1,H,W]
+        mm = torch.nn.functional.conv2d(mm, k.view(1, 1, 1, -1), padding=(0, radius))
+        mm = torch.nn.functional.conv2d(mm, k.view(1, 1, -1, 1), padding=(radius, 0))
+        return mm.squeeze(1).clamp(0.0, 1.0)
+
+    def inpaint(self, samples, mask, grow=0, feather=16, invert=False,
+                temporal_mode="max"):
+        v = samples["samples"]
+        if _HAS_NESTED and isinstance(v, NestedTensor):
+            raise ValueError(
+                "[LTXInpaintLatent] got an AV NestedTensor — separate the video "
+                "latent first (LTXVSeparateAVLatent), inpaint it, re-concat audio."
+            )
+        if v.ndim != 5:
+            raise ValueError(
+                f"[LTXInpaintLatent] expected a 5D video latent [B,C,T,H,W], "
+                f"got {v.ndim}D."
+            )
+        B, C, T, H, W = v.shape
+
+        F = torch.nn.functional
+        m = mask.float()
+        if m.ndim == 2:
+            m = m.unsqueeze(0)                                   # [1,H,W]
+        elif m.ndim == 4:
+            m = m.squeeze(1) if m.shape[1] == 1 else m[0]        # -> [N,H,W]
+        # Morphology on the latent's device (GPU) — a full-res per-frame video
+        # mask is far too heavy for CPU. Kept as [N,H,W]; ops are batched.
+        m = m.clamp(0.0, 1.0).to(v.device)
+        if invert:
+            m = 1.0 - m
+        if grow > 0:
+            # Separable dilation: max over rows then columns (identical to a
+            # square max-pool, ~kernel× cheaper — the non-separable version
+            # hangs at grow 32).
+            k = grow * 2 + 1
+            mm = m.unsqueeze(1)                                  # [N,1,H,W]
+            mm = F.max_pool2d(mm, (k, 1), stride=1, padding=(grow, 0))
+            mm = F.max_pool2d(mm, (1, k), stride=1, padding=(0, grow))
+            m = mm.squeeze(1)
+        if feather > 0:
+            m = self._gaussian_blur(m, feather)                 # separable, same device
+        m = m.clamp(0.0, 1.0)                                    # [N,H,W] pixel mask
+
+        # latent-grid mask for the zeroing — temporal reduction per LTX 8-frame
+        # group (temporal_mode; a moving mask stays crisp vs trilinear blur)
+        ml = ltx_mask_to_latent(m, T, H, W, mode=temporal_mode).to(
+            device=v.device, dtype=v.dtype)
+
+        v_out = v * (1.0 - ml)                                   # zero the masked region
+        kept = float((ml < 0.5).float().mean())
+        print(f"[LTXInpaintLatent] zeroed masked region of a {W}x{H} latent "
+              f"(~{(1 - kept) * 100:.1f}% regenerate); grow {grow}px, feather {feather}px"
+              + (", inverted" if invert else "") + ".")
+        return ({"samples": v_out}, m)
+
+
+class LTXRemovalEncode:
+    """
+    One-node subject removal prep = the validated chain in a single step, with
+    the dialed-in values locked so they can't drift: pixel noise-fill → VAE
+    encode → latent zero, all on the SAME tight mask.
+
+    - Removes the subject in PIXELS (gone from the latent everywhere → the VAE
+      can't smear it from kept cells back into the hole).
+    - Fills the hole with decoded (on-manifold) noise at low scale.
+    - Encodes, then ZEROS the exact hole in the latent (temporal_mode over the
+      8:1 grid) so the model reads nothing there and regenerates fresh.
+
+    Locked internally: tight mask (grow/feather 0), noise_mode = decoded,
+    noise_scale = 0.1, fixed seed. Output: (video latent, tight mask). Concat
+    the latent with audio → sampler `latents`; grow+blur the mask (KJ
+    GrowMaskWithBlur, expand ≥ blur_radius) → optional_denoise_mask, and set the
+    sampler's denoise_mask_temporal_mode to match temporal_mode here.
+    """
+
+    _SEED = 0
+    _NOISE_SCALE = 0.1
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",),
+                "vae": ("VAE",),
+            },
+            "optional": {
+                "temporal_mode": (["max", "last", "mean_threshold", "min"], {
+                    "default": "last",
+                    "tooltip": "Per-frame mask reduction onto the 8:1 latent grid. "
+                               "last = causal-aligned crisp (best across cuts); max = "
+                               "union (safe, blobs at cuts). Match the sampler's "
+                               "denoise_mask_temporal_mode.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "MASK")
+    RETURN_NAMES = ("latent", "mask")
+    FUNCTION     = "prep"
+    CATEGORY     = "LTXAVTools/utils"
+    DESCRIPTION  = (
+        "Subject removal prep in one node: tight pixel noise-fill + VAE encode "
+        "+ latent zero on one mask, locked recipe. Latent → concat audio → "
+        "sampler; mask → grow+blur → optional_denoise_mask."
+    )
+
+    def prep(self, images, mask, vae, temporal_mode="last"):
+        # tight pixel noise-fill (grow stays on the denoise side)
+        filled, m = LTXNoiseFill().fill(
+            images, mask, vae, noise_mode="decoded", grow=0,
+            seed=self._SEED, noise_scale=self._NOISE_SCALE)
+        # encode the person-free composite
+        lat = vae.encode(filled)
+        if isinstance(lat, dict):
+            lat = lat.get("samples", lat)
+        # zero the exact hole (same tight mask, temporal_mode)
+        T, H, W = lat.shape[2], lat.shape[3], lat.shape[4]
+        ml = ltx_mask_to_latent(m, T, H, W, mode=temporal_mode).to(
+            device=lat.device, dtype=lat.dtype)
+        out = lat * (1.0 - ml)
+        print(f"[LTXRemovalEncode] tight noise-fill + encode + zero "
+              f"(temporal={temporal_mode}); latent {lat.shape[4]}x{lat.shape[3]}x{T}.")
+        return ({"samples": out}, m)
+
+
 NODE_CLASS_MAPPINGS = {
     "PreviewImagePassthrough":          PreviewImagePassthrough,
     "LTXAVLatentCheck":                 LTXAVLatentCheck,
@@ -1336,6 +1709,9 @@ NODE_CLASS_MAPPINGS = {
     "LTXStreamingVideoEncode":          LTXStreamingVideoEncode,
     "LTXInpaintColorFill":              LTXInpaintColorFill,
     "LTXVideoOutpaintLatent":           LTXVideoOutpaintLatent,
+    "LTXInpaintLatent":                 LTXInpaintLatent,
+    "LTXNoiseFill":                     LTXNoiseFill,
+    "LTXRemovalEncode":                 LTXRemovalEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1351,4 +1727,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXStreamingVideoEncode":          "LTX Streaming Video Encode",
     "LTXInpaintColorFill":              "LTX Inpaint Color Fill",
     "LTXVideoOutpaintLatent":           "LTX Video Outpaint Latent",
+    "LTXInpaintLatent":                 "LTX Inpaint Latent",
+    "LTXNoiseFill":                     "LTX Noise Fill (pixel removal)",
+    "LTXRemovalEncode":                 "LTX Removal Encode",
 }
