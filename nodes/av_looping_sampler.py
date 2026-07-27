@@ -1417,6 +1417,21 @@ class LTXVAVLoopingSampler:
             total_size=frames * time_scale - 7,
             label="optional_cond_image_indices",
         )
+        # Reconcile index/image counts BEFORE building the per-tile routing.
+        # The routing indexes into the image batch positionally, so an index
+        # with no matching image is an IndexError at chunk time, not a benign
+        # extra. (This used to only warn, after the routing was already built.)
+        if optional_cond_images is not None:
+            n_img = optional_cond_images.shape[0]
+            n_idx = len(kf_indices)
+            if n_idx != n_img:
+                keep = min(n_idx, n_img)
+                dropped = "indices" if n_idx > n_img else "images"
+                print(f"[LTXVAVLoopingSampler] WARNING: {n_idx} cond_image_indices "
+                      f"but {n_img} cond_images — placing {keep} keyframe(s), extra "
+                      f"{dropped} dropped. (Keyframe Planner's `count` output = the "
+                      f"number of images to supply.)")
+                kf_indices = kf_indices[:keep]
         kf_per_tile = self._calculate_keyframe_per_tile_indices(
             kf_indices, chunk_schedule, overlap_v, time_scale
         )
@@ -1444,15 +1459,7 @@ class LTXVAVLoopingSampler:
                         "bilinear", crop="center",
                     ).movedim(1, -1).clamp(0, 1)
                 )
-            # Images pair with indices positionally (zip); the shorter list wins.
-            n_img = optional_cond_images.shape[0]
-            n_idx = len(kf_indices)
-            if n_img != n_idx:
-                dropped = ("indices" if n_idx > n_img else "images")
-                print(f"[LTXVAVLoopingSampler] WARNING: {n_idx} cond_image_indices but "
-                      f"{n_img} cond_images — only {min(n_idx, n_img)} keyframes placed, "
-                      f"extra {dropped} dropped. (Keyframe Planner's `count` output = "
-                      f"the number of images to supply.)")
+            # (count reconciliation happens before kf_per_tile is built, above)
         else:
             optional_keyframes = None
             if optional_cond_image_indices and optional_cond_image_indices.strip() not in ("", "0"):
