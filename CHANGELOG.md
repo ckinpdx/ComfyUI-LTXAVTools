@@ -240,7 +240,7 @@
   path; `L → 2L−1` temporal). Temporal tiles anchor at `2×` input position with
   malformed tile-head latents dropped (`head_trim`, new appended input) and
   crossfades in output coordinates. Previously the temporal upsampler crashed
-  the tiled node with a tensor-size mismatch. See `SPEC_TILED_TEMPORAL.md`.
+  the tiled node with a tensor-size mismatch. See `SPEC_TILED_TEMPORAL`.
 - **LTX AV Reference Audio Bank (Carry-Swap)** (`LTXAVReferenceAudioBank`): up to
   four reference voices + a per-chunk voice schedule (`1|2|1|2`) for turn-based
   dialog voice identity. No ID-LoRA required. See `SPEC_NEG_REF_AUDIO.md`.

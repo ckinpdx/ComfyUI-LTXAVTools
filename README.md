@@ -265,7 +265,7 @@ Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four 
 
 ### LTX AV Add IC References
 
-Out-of-band IC-LoRA reference views for the **looping sampler** — identity conditioning that has no timeline position and must be present in *every* chunk. See [SPEC_IC_REFERENCES.md](SPEC_IC_REFERENCES.md).
+Out-of-band IC-LoRA reference views for the **looping sampler** — identity conditioning that has no timeline position and must be present in *every* chunk. See SPEC_IC_REFERENCES.
 
 > **This node does nothing on a stock sampler.** It attaches an inert `ic_reference_pack` to the positive conditioning; the *looping sampler* is what turns it into guide tokens, per chunk, after that chunk's conditioning is assembled. Wire it into `SamplerCustomAdvanced` and the pack rides along ignored — by design, not by bug. Injecting after assembly is what makes it survive MultiPromptProvider (which replaces per-chunk conditioning wholesale, the way `ref_audio` used to get dropped).
 
@@ -345,7 +345,7 @@ AV-aware wrapper around the LTX latent upscale model. Upsamples the video compon
 ### LTX AV Latent Upsampler (Tiled)
 Temporally tiled variant: overlapping temporal tiles are upsampled on GPU and blended back with a linear crossfade. Viable when the result feeds a low-sigma refinement pass, which smooths residual tile-statistics differences. Use the non-tiled version when exact full-tensor statistics matter.
 
-**Supports both spatial and temporal upscalers — auto-detected** from the first tile's output shape (`L → L` spatial; `L → 2L−1` temporal, per the first-frame asymmetry: the LTX temporal upsampler doubles the pixel timeline, so `T` latents become `2T−1`). In temporal mode, tiles are anchored at `2×` their input position and each non-first tile's head latents are dropped (`head_trim`) — tile heads are malformed video-start latents; the previous tile owns that region and the crossfade spans the remaining `2·overlap−1−head_trim` latents. See [SPEC_TILED_TEMPORAL.md](SPEC_TILED_TEMPORAL.md). Temporal output is 50 fps material — single-shot refinement only (the AV Looping Sampler's audio math is 25 fps).
+**Supports both spatial and temporal upscalers — auto-detected** from the first tile's output shape (`L → L` spatial; `L → 2L−1` temporal, per the first-frame asymmetry: the LTX temporal upsampler doubles the pixel timeline, so `T` latents become `2T−1`). In temporal mode, tiles are anchored at `2×` their input position and each non-first tile's head latents are dropped (`head_trim`) — tile heads are malformed video-start latents; the previous tile owns that region and the crossfade spans the remaining `2·overlap−1−head_trim` latents. See SPEC_TILED_TEMPORAL. Temporal output is 50 fps material — single-shot refinement only (the AV Looping Sampler's audio math is 25 fps).
 
 | Input | Default | Description |
 |---|---|---|
@@ -394,7 +394,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `horizontal_tiles` | 1 | Number of spatial tiles horizontally. |
 | `vertical_tiles` | 1 | Number of spatial tiles vertically. Audio is accumulated from tile (0,0) only. |
 | `spatial_overlap` | 1 | Latent-space pixels of spatial overlap between tiles. |
-| `video_fps` | 25.0 | Drives the **audio arithmetic only** — audio counts are differences of the global boundary map `audio_pos` (see `SPEC_50FPS.md`), exact at any fps dividing 200 (1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200); other rates warn and carry a bounded ~20 ms per-boundary quantization that does **not** accumulate. **This widget does not tell the model the frame rate** — the model's temporal RoPE reads `frame_rate` from the conditioning, so a graph without `LTXVConditioning` runs at 25 regardless of this value. Set both, and match your Scene Length / Frame calculators. |
+| `video_fps` | 25.0 | Drives the **audio arithmetic only** — audio counts are differences of the global boundary map `audio_pos` (see `SPEC_50FPS`), exact at any fps dividing 200 (1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200); other rates warn and carry a bounded ~20 ms per-boundary quantization that does **not** accumulate. **This widget does not tell the model the frame rate** — the model's temporal RoPE reads `frame_rate` from the conditioning, so a graph without `LTXVConditioning` runs at 25 regardless of this value. Set both, and match your Scene Length / Frame calculators. |
 
 ### Optional inputs
 

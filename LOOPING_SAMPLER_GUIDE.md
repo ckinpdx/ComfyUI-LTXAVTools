@@ -91,7 +91,7 @@ graph is consistent.
 Audio boundaries are **exact** at any fps dividing 200 (1, 2, 4, 5, 8, 10, 20, 25, 40,
 50, 100, 200); the sampler warns on anything else. Off-grid rates like 24 and 30 are
 *workable* — they carry a bounded ~20 ms per-boundary quantization but **no cumulative
-drift**, since every length is a difference of one global boundary map (`SPEC_50FPS.md`).
+drift**, since every length is a difference of one global boundary map (`SPEC_50FPS`).
 
 **Getting to 50 fps: upsample, don't generate.** The temporal upsampler's `L → 2L−1`
 conversion *is* the 25 → 50 path, and the audio needs no adjustment at all —
