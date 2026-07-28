@@ -1,6 +1,91 @@
 # Changelog
 
+## 1.2.0 — 2026-07-27
+
+### Added
+- **LTX LoRA Metadata Reader: `factor_int` output.** The reader emitted the
+  downscale factor only as FLOAT, but several consumers are INT-typed —
+  notably `LTXVDilateLatent`'s `horizontal_scale` / `vertical_scale` — and
+  ComfyUI will not link FLOAT into an INT input, so the factor appeared to be
+  "not picked up" downstream with no error. Now emitted as both.
+  - **Appended, not inserted.** ComfyUI links outputs by INDEX; adding the INT
+    beside the FLOAT would have silently re-pointed every existing `metadata`
+    link in saved workflows. Existing graphs are unaffected.
+  - Still FLOAT for `guiding_downscale_factor` (AV Looping Sampler) and
+    `latent_downscale_factor` (LTX AV Add IC References) — both are FLOAT
+    inputs and unchanged.
+
 ## 1.1.0 — 2026-07-15
+
+### Added
+- **LTX AV Add IC References** (2026-07-27, verified in use; §4.1 tensor diff
+  exact, MSR end-to-end confirmed). Out-of-band IC-LoRA reference views for the
+  looping sampler — identity conditioning with no timeline position that must
+  be present in every chunk. The node encodes once and attaches an **inert**
+  `ic_reference_pack`; the sampler injects it per chunk *after* conditioning
+  assembly, which is what makes it survive MultiPromptProvider (§2.4). It does
+  nothing on a stock sampler, by design.
+  - **Convention verified by tensor diff, not by eye.** `apply_ic_references()`
+    was diffed field-by-field against `LTXAddVideoICLoRAGuide` across
+    {1,3,4} views × factor {1,2,4}: appended latent region, `noise_mask`,
+    `keyframe_idxs` (start *and* end — the small-grid RoPE end-offset lives
+    there), and the `guide_attention_entries` record. Exact match, maxdiff 0.
+  - **Fixes a silent-truncation trap.** The temporal VAE keeps `((N−1)//8)*8+1`
+    pixel frames, so a batch of 4 reference views encodes **1** and discards
+    three with no error. `layout=one_latent_per_view` stacks them as
+    `[v0, v1×8, …]` = `8(N−1)+1` so every view survives on its own latent frame;
+    the node then asserts the encoded count rather than trusting it.
+  - Implemented as a thin caller of the sampler's existing `_add_latent_guide`
+    rather than a reimplementation — one copy of the convention, so core's
+    frame accounting can change under it in one place.
+  - **`layout=as_sequence` unlocks MSR.** The Licon MSR node emits an
+    already-latent-aligned reference video (subjects on whole latent frames,
+    background last: 41 frames -> 6 latents). It must be encoded as-is;
+    `one_latent_per_view` would read its 41 frames as 41 views, destroying the
+    multiplex and costing ~7x the tokens. Verified in use — this closes the
+    2026-07-13 finding that long-form MSR was blocked on per-chunk injection.
+  - v1 limits: single spatial tile (warns and skips under tiling), one pack.
+- **Frame-rate mismatch check** — see Fixed, below.
+- **50 fps audio support — `audio_pos` global boundary map** (2026-07-27,
+  SPEC_50FPS implemented; validated `delta 0` at 25 fps regression and at
+  50 fps with conditioned audio). Every audio count in the sampler is now a
+  **difference of one global boundary map** rather than a chunk-local span:
+  `a_carry = audio_pos(ov)`, `a_new = audio_pos(e) − audio_pos(s)`. Because
+  `audio_pos(n) = (n−1)·q + floor(q/8 + 0.5)` for `q = 200/fps`, the rounding
+  term is constant and cancels in any difference — so lengths telescope and
+  cumulative drift is impossible. Previously every chunk-local span at 50 fps
+  landed on exactly x.5 and rounded by parity (±1 audio frame per boundary,
+  accumulating). Migrated: sampler chunk-0 / extend / debug / final trim,
+  `LTXAVLatentCheck`, `LTXAVSeparateCheck`, `LTXAVExtendLatent`. At 25 fps all
+  values are algebraically identical — outputs unchanged.
+  - **Bonus:** off-grid rates (24, 30) no longer *accumulate* drift either —
+    they retain only a bounded ~20 ms per-boundary quantization. 24 fps went
+    from broken to workable.
+  - **`video_fps` now warns** when `200/fps` is not an integer, listing the
+    exact rates (1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200).
+
+### Fixed
+- **`frame_rate` now carried onto per-chunk prompts** (2026-07-27): with
+  MultiPromptProvider the per-chunk conditionings are bare text encodes and
+  carry no `frame_rate`, which `model_base.py` defaults to **25 per
+  conditioning** — so the positive branch ran at 25 while the negative (via
+  `LTXVConditioning`) ran at the real rate, putting the two CFG branches on
+  different time axes. `_prepare_guider` now carries it, mirroring the
+  `ref_audio` fix. Invisible at 25 fps; desyncs at any other rate.
+  - Related, not a code bug: **a graph with no `LTXVConditioning` node runs the
+    model at 25 fps no matter what the sampler widget says** — the sampler's
+    `video_fps` drives audio arithmetic only, while the model's temporal RoPE
+    reads `frame_rate` from conditioning.
+- **Frame-rate mismatch is now caught before the render, not after** (2026-07-27).
+  The failure above is silent at render time: the audio is internally consistent
+  (Latent Check reports `delta 0`, because it *is* correct for the sampler's
+  rate) while the video is paced for 25 — you only find out on playback, an
+  entire generation later. The sampler now inspects the guider's conditioning up
+  front and warns on four shapes: conditioning carries no `frame_rate` while
+  `video_fps ≠ 25` (missing `LTXVConditioning`); conditioning `frame_rate` ≠
+  `video_fps` (reports the exact drift factor); positive and negative on
+  different rates; positive set but negative defaulting. Diagnostic only —
+  nothing is mutated, and an unrecognized guider shape is skipped silently.
 
 ### Added
 - **Subject removal nodes** (2026-07-24, validated on basic scenes):

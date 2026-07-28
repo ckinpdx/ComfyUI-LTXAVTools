@@ -67,6 +67,41 @@ empty latent, so the schedule and the canvas cannot disagree.
 - `video_fps` should be 25 for AV work — audio runs at a fixed 25 latents/second, giving
   1:1 pixel-frame↔audio-frame alignment.
 
+### Frame rate: two settings, and only one of them talks to the model
+
+This catches people, and it fails silently:
+
+| setting | governs |
+|---|---|
+| sampler `video_fps` | **audio arithmetic only** (chunk lengths, carry, stitch) |
+| **`LTXVConditioning` `frame_rate`** | the model's temporal RoPE — how video frames are placed on the time axis |
+| Scene Length / Frame calculators | how many frames a given duration asks for |
+
+`model_base.py` reads `frame_rate` **per conditioning** and defaults it to **25**. So a
+graph with no `LTXVConditioning` node runs the model at 25 no matter what the sampler
+widget says. The symptom is nasty precisely because nothing errors: the Latent Check
+reports `delta 0` (the audio is correct *for the sampler's rate*) while the video is
+paced for 25 — it only looks right at 25 fps playback.
+
+The sampler checks this before sampling and warns if the conditioning carries no
+`frame_rate` while `video_fps ≠ 25`, if the two disagree (it prints the drift factor), or
+if the positive and negative branches are on different rates. A quiet console means the
+graph is consistent.
+
+Audio boundaries are **exact** at any fps dividing 200 (1, 2, 4, 5, 8, 10, 20, 25, 40,
+50, 100, 200); the sampler warns on anything else. Off-grid rates like 24 and 30 are
+*workable* — they carry a bounded ~20 ms per-boundary quantization but **no cumulative
+drift**, since every length is a difference of one global boundary map (`SPEC_50FPS.md`).
+
+**Getting to 50 fps: upsample, don't generate.** The temporal upsampler's `L → 2L−1`
+conversion *is* the 25 → 50 path, and the audio needs no adjustment at all —
+`audio_pos(T, 25) == audio_pos(2T−1, 50)` exactly, because `q` halves as the latent count
+doubles. Generating at 25 and upsampling keeps the entire sync doctrine in this guide
+(anchor beats, 1.0/1.0 overlaps, dialog budgets), all of which was tuned at 25. Afterwards
+every consumer must be told 50 — Latent Check `fps`, Streaming Save `fps`, and any
+second-pass `LTXVConditioning`. The latent carries no rate; it is interpretation all the
+way down.
+
 ---
 
 ## 3. Continuity levers (the sync-critical pair)

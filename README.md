@@ -86,10 +86,15 @@ Reads a LoRA's safetensors metadata header — no weight loading, no VRAM, milli
 ```
 Metadata Reader ── lora_path ─────────────▶ KJ LTX2 LoRA Loader Advanced .opt_lora_path
               ├── latent_downscale_factor ─▶ AV Looping Sampler .guiding_downscale_factor
-              └── metadata ────────────────▶ (inspection — works on any LoRA's header)
+              │      (FLOAT)                 LTX AV Add IC References .latent_downscale_factor
+              ├── metadata ────────────────▶ (inspection — works on any LoRA's header)
+              └── factor_int ──────────────▶ LTXV Dilate Latent .horizontal_scale / .vertical_scale
+                     (INT)                   and any other INT-typed consumer
 ```
 
-The factor comes from the LoRA's own `reference_downscale_factor` metadata (pixel spatial upscaler x2 = 2, x4 = 4). When `opt_lora_path` is connected, the KJ loader's own combo is ignored.
+The factor comes from the LoRA's own `reference_downscale_factor` metadata (pixel spatial upscaler x2 = 2, x4 = 4). Key lookup is prefix-agnostic, so `ss_reference_downscale_factor` (sd-scripts/kohya/musubi) matches too. When `opt_lora_path` is connected, the KJ loader's own combo is ignored.
+
+**Use `factor_int` for INT-typed inputs.** ComfyUI will not link a FLOAT into an INT socket, and it fails *silently at the UI level* — no error, the target keeps its default of 1, everything runs, and the only symptom is that small-grid guides come out soft. If a factor seems "not picked up," check the socket type first.
 
 ### LTX AV Streaming Decode & Save
 Long-video export without the RAM cliff: decodes the video latent in temporal chunks and pipes frames directly into a persistent ffmpeg encode — **the full pixel tensor never exists**, so RAM use is constant at any length. Each chunk decodes with `context_latents` of leading context that are trimmed from the output; because the LTX video VAE is temporally causal this makes the chunked decode **exact** (bit-identical to a full decode, no blending, no seams). Frame count preserved exactly (`(T−1)×8+1`). Shows an inline player when finished (streams from disk — previewing also costs no RAM).
@@ -258,6 +263,39 @@ Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four 
 
 ---
 
+### LTX AV Add IC References
+
+Out-of-band IC-LoRA reference views for the **looping sampler** — identity conditioning that has no timeline position and must be present in *every* chunk. See [SPEC_IC_REFERENCES.md](SPEC_IC_REFERENCES.md).
+
+> **This node does nothing on a stock sampler.** It attaches an inert `ic_reference_pack` to the positive conditioning; the *looping sampler* is what turns it into guide tokens, per chunk, after that chunk's conditioning is assembled. Wire it into `SamplerCustomAdvanced` and the pack rides along ignored — by design, not by bug. Injecting after assembly is what makes it survive MultiPromptProvider (which replaces per-chunk conditioning wholesale, the way `ref_audio` used to get dropped).
+
+| Input | Description |
+|---|---|
+| `positive` / `negative` | passed through; the pack is attached to positive |
+| `vae` | LTXV video VAE — the node owns the encode so the downscale factor is always honored |
+| `reference_images` | the views (identity stills, turnaround, etc.) |
+| `width` / `height` | **generation** pixel dims, not the reference's. Mismatch with the sampler's latent is a hard error at inject time, not a silent stretch |
+| `strength` | IC convention is **1.0**; below 1.0 is known to bleed |
+| `latent_downscale_factor` | from the LoRA's `reference_downscale_factor` metadata — wire from *LTX LoRA Metadata Reader* or `LTXICLoRALoaderModelOnly`. 1 = full grid, 2 = half |
+| `layout` | `one_latent_per_view` (default), `as_sequence`, or `single_frame` |
+| `crop` | `disabled` stretches, `center` crops |
+
+**Why `layout` exists — the silent-truncation trap.** The temporal VAE keeps `((N−1)//8)*8+1` pixel frames, so handing it a batch of 4 reference views encodes **1** and discards three with no error and no warning; the run just comes out weakly conditioned. `one_latent_per_view` lays the stack out as `[v0, v1×8, v2×8, …]` = `8(N−1)+1` frames, which is exactly `8n+1`, so every view survives and lands on its own latent frame. The node asserts the encoded frame count matches the view count rather than trusting it. Use `single_frame` only when you have deliberately pre-composited a reference *sheet*.
+
+**`as_sequence` — for MSR and any pre-built temporal multiplex.** The [Licon MSR](https://github.com/liconstudio/ComfyUI-Licon-MSR) node emits a reference *video* that is already latent-aligned: each subject occupies whole latent frames and the background is placed last. At `frame_count=41` that is 6 latents — `s1:L0-1  s2:L2  s3:L3  s4:L4  bg:L5`. That structure is the conditioning, so it must be encoded **as-is**:
+
+| layout | 41-frame MSR video becomes | |
+|---|---|---|
+| `one_latent_per_view` | 321 px → **41 latents** | wrong — treats each frame as a view, multiplex destroyed, ~7× the token cost |
+| `as_sequence` | 41 px → **6 latents** | correct — matches what MSR built |
+| `single_frame` | 1 px → **1 latent** | wrong — subject 1 only |
+
+Use `frame_count` ≥ 41 for four subjects; at 17 and 25 the subject budget is smaller than the subject count and MSR falls back to a crowded allocation where subjects share latent frames.
+
+**Cost.** `views × (h/factor) × (w/factor)` tokens in every chunk. Four views at factor 2 on 768×512 ≈ 384 real tokens. At `factor > 1` the console also prints a larger "pre-filter" count — that is the dilated grid before the model's `grid_mask` drops the `-1` holes; the smaller number is the real attention cost.
+
+**v1 limits:** single spatial tile only (full-frame references have no correspondence to a tile crop — the sampler warns and skips when tiling is active). One pack per run.
+
 ### LTX AV Cross-Attention Toggle
 Switches the LTX2.3 AV model's cross-modal attention couplings on/off via `transformer_options` (read at `av_model.py` `run_a2v` / `run_v2a`). Takes a `MODEL`, returns a patched clone (source untouched). Both default **on**, so it is a no-op until you flip one. Works with any sampler — wire it on the model line before the sampler.
 
@@ -356,7 +394,7 @@ Input latent must be an AV NestedTensor sized to the full output — the video c
 | `horizontal_tiles` | 1 | Number of spatial tiles horizontally. |
 | `vertical_tiles` | 1 | Number of spatial tiles vertically. Audio is accumulated from tile (0,0) only. |
 | `spatial_overlap` | 1 | Latent-space pixels of spatial overlap between tiles. |
-| `video_fps` | 25.0 | Must match the fps of the AV latent. Used for audio frame alignment. LTX2.3 AV is trained at 25 fps. |
+| `video_fps` | 25.0 | Drives the **audio arithmetic only** — audio counts are differences of the global boundary map `audio_pos` (see `SPEC_50FPS.md`), exact at any fps dividing 200 (1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200); other rates warn and carry a bounded ~20 ms per-boundary quantization that does **not** accumulate. **This widget does not tell the model the frame rate** — the model's temporal RoPE reads `frame_rate` from the conditioning, so a graph without `LTXVConditioning` runs at 25 regardless of this value. Set both, and match your Scene Length / Frame calculators. |
 
 ### Optional inputs
 
