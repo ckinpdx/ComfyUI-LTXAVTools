@@ -4,9 +4,9 @@ import torch
 import comfy.model_management
 from comfy.nested_tensor import NestedTensor
 
-# audio_pos is unused until the SPEC_50FPS refactor lands; imported here so the
-# constant has exactly one definition (see utils.audio_pos).
-from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos  # noqa: F401
+# audio_pos: the global audio boundary map (SPEC_50FPS). One definition of the
+# rate constant lives in utils alongside it.
+from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos
 
 
 _LTX_VIDEO_LATENT_CHANNELS = 128
@@ -220,8 +220,9 @@ class LTXAVExtendLatent:
 
         # Combined totals
         combined_T_v  = T_v + ext_video_latents
-        total_px      = (combined_T_v - 1) * time_sc + 1
-        total_audio   = round(total_px / fps * self._AUDIO_LATENTS_PER_SECOND)
+        # SPEC_50FPS: audio_pos is the global boundary map; exact at any fps
+        # dividing 200. Assumes the LTX 8:1 grid (time_sc == 8).
+        total_audio   = audio_pos(combined_T_v, fps)
         ext_audio     = max(0, total_audio - T_a)
 
         # Build combined tensors
