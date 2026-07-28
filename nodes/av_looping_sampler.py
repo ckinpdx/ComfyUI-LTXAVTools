@@ -29,17 +29,22 @@ from comfy_extras.nodes_lt import (
     get_noise_mask,
 )
 
-# audio_pos is the global audio boundary map (SPEC_50FPS); imported now so the
-# rate constant has one definition. Current call sites still use the local
-# chunk-span helpers below — swapping them over is the 50 fps refactor itself.
+# audio_pos is the global audio boundary map and the single source of truth for
+# every audio length in this file (SPEC_50FPS, implemented 2026-07-27). The
+# chunk-local helpers below are deprecated shims kept only for external callers.
 from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos, ltx_mask_to_latent  # noqa: F401
+from .ic_reference import IC_PACK_KEY, apply_ic_references, get_ic_pack
 
 
 # ---------------------------------------------------------------------------
 # Audio / latent utilities
 # ---------------------------------------------------------------------------
 
-def _audio_frames_for_video_chunk(v_latent_frames, fps):
+def _audio_frames_for_video_chunk(v_latent_frames, fps):  # DEPRECATED: chunk-local
+    """SUPERSEDED by utils.audio_pos (SPEC_50FPS). Kept only so external callers
+    do not break; do NOT use for new code. Chunk-local spans re-introduce the
+    first-frame asymmetry per chunk, which is exact at 25 fps but rounds by
+    parity at 50 (+-1 audio frame per boundary, cumulative)."""
     """
     Audio latent frames for a video chunk of v_latent_frames, accounting for
     the first-frame asymmetry (pos 0 = 1 px, all others = 8 px).
@@ -558,8 +563,8 @@ class LTXVAVLoopingSampler:
         return video_cropped["samples"], audio_out, positive, negative
 
     def _debug_chunk(self, chunk_idx, v_start, v_end, T_v, a_start, a_end, T_a, fps):
-        px       = (T_v - 1) * 8 + 1
-        expected = round(px / fps * AUDIO_LATENTS_PER_SECOND)
+        # Expected from the global boundary map (SPEC_50FPS), not a local span.
+        expected = audio_pos(T_v, fps)
         delta    = T_a - expected
         status   = "OK" if delta == 0 else f"MISMATCH delta={delta:+d}"
         print(
@@ -636,9 +641,103 @@ class LTXVAVLoopingSampler:
             chunk_neg = node_helpers.conditioning_set_values(
                 negative, {"ref_audio": ref_audio}
             )
+
+        # Carry frame_rate onto the per-chunk conditioning. MultiPromptProvider
+        # encodes bare text, so its conds have no frame_rate key — and
+        # model_base reads it PER CONDITIONING, defaulting to 25. Without this
+        # the positive branch would silently run at 25 while the negative
+        # (which came through LTXVConditioning) ran at the real rate: the two
+        # CFG branches on different time axes. Same failure shape as the
+        # ref_audio carryover above. Invisible at 25 fps; desyncs at 50.
+        frame_rate = base_vals.get("frame_rate")
+        if frame_rate is not None and chunk_pos:
+            if chunk_pos[0][1].get("frame_rate") != frame_rate:
+                print(f"[LTXVAVLoopingSampler] chunk {chunk_index}: carrying "
+                      f"frame_rate={frame_rate} onto the per-chunk prompt "
+                      f"(bare encodes default to 25).")
+            chunk_pos = node_helpers.conditioning_set_values(
+                chunk_pos, {"frame_rate": frame_rate}
+            )
+
+        # Carry the IC reference pack for the same reason as the two above: the
+        # per-chunk conditioning is a bare encode and would otherwise arrive
+        # without it, silently dropping the references on every chunk after the
+        # first. Still INERT here — the chunk builders inject it.
+        ic_pack = base_vals.get(IC_PACK_KEY)
+        if ic_pack is not None and chunk_pos:
+            chunk_pos = node_helpers.conditioning_set_values(
+                chunk_pos, {IC_PACK_KEY: ic_pack}
+            )
+
         new_g.set_conds(chunk_pos, chunk_neg)
         new_g.raw_conds = (chunk_pos, chunk_neg)
         return new_g
+
+    def _check_frame_rate(self, guider, video_fps):
+        """
+        Warn when the model's frame rate disagrees with the sampler's.
+
+        Two different settings, and only one of them reaches the model:
+          - this node's `video_fps` governs AUDIO ARITHMETIC (chunk lengths,
+            carry, stitch) and nothing else;
+          - `frame_rate`, set on the CONDITIONING by LTXVConditioning, is what
+            model_base reads (per conditioning, DEFAULTING TO 25) to place video
+            frames on the temporal RoPE axis.
+
+        So a graph with no LTXVConditioning runs the model at 25 whatever this
+        widget says. The failure is silent: audio is internally consistent (the
+        Latent Check reports delta 0, because it is correct FOR THE SAMPLER'S
+        RATE) while the video is paced for 25 — it only looks right at 25 fps
+        playback. Costs a full render to notice, hence this check up front.
+        Everything here is diagnostic only; nothing is mutated.
+        """
+        try:
+            positive, negative = _get_raw_conds(guider)
+        except Exception:
+            return  # custom guider shape — nothing to inspect, not an error
+        if not positive:
+            return
+
+        MODEL_DEFAULT_FPS = 25.0  # model_base.py: kwargs.get("frame_rate", 25)
+        pos_fr = positive[0][1].get("frame_rate")
+        neg_fr = negative[0][1].get("frame_rate") if negative else None
+
+        if pos_fr is None:
+            if abs(float(video_fps) - MODEL_DEFAULT_FPS) > 1e-6:
+                print(
+                    f"[LTXVAVLoopingSampler] WARNING: video_fps={video_fps} but the "
+                    f"positive conditioning carries no frame_rate — the model will "
+                    f"run at its default {MODEL_DEFAULT_FPS:g} fps. The audio will be "
+                    f"built for {video_fps:g} and the video paced for "
+                    f"{MODEL_DEFAULT_FPS:g}, so they will not line up. Add an "
+                    f"LTXVConditioning node (frame_rate={video_fps:g}) between the "
+                    f"text encode and the guider."
+                )
+            return
+
+        if abs(float(pos_fr) - float(video_fps)) > 1e-6:
+            print(
+                f"[LTXVAVLoopingSampler] WARNING: frame rate mismatch — conditioning "
+                f"frame_rate={float(pos_fr):g} vs this node's video_fps={video_fps:g}. "
+                f"The model paces video at {float(pos_fr):g} while the audio is built "
+                f"for {video_fps:g}; the result will drift by a factor of "
+                f"{float(pos_fr) / float(video_fps):.3f}. Set both to the same value."
+            )
+
+        if neg_fr is not None and abs(float(neg_fr) - float(pos_fr)) > 1e-6:
+            print(
+                f"[LTXVAVLoopingSampler] WARNING: positive conditioning is at "
+                f"frame_rate={float(pos_fr):g} but negative is at {float(neg_fr):g} — "
+                f"the two CFG branches are on different time axes. Route both through "
+                f"the same LTXVConditioning settings."
+            )
+        elif neg_fr is None and negative:
+            print(
+                f"[LTXVAVLoopingSampler] WARNING: positive conditioning is at "
+                f"frame_rate={float(pos_fr):g} but the negative carries none, so it "
+                f"defaults to {MODEL_DEFAULT_FPS:g} — the two CFG branches are on "
+                f"different time axes. Route the negative through LTXVConditioning too."
+            )
 
     def _calculate_keyframe_per_tile_indices(self, keyframe_indices,
                                               chunk_schedule, temporal_overlap,
@@ -766,7 +865,9 @@ class LTXVAVLoopingSampler:
         B   = video_init["samples"].shape[0]
         C_a = audio_full.shape[1]
         F_s = audio_full.shape[3]
-        T_a = _audio_frames_for_video_chunk(T_v, fps)
+        # SPEC_50FPS: chunk 0 spans global latents [0, T_v), so its audio length
+        # is audio_pos(T_v) - audio_pos(0) = audio_pos(T_v).
+        T_a = audio_pos(T_v, fps)
         if audio_cond_strength > 0.0:
             T_a = min(T_a, audio_full.shape[2])
             audio_init = audio_full[:, :, :T_a, :].clone()
@@ -780,6 +881,19 @@ class LTXVAVLoopingSampler:
         audio_mask_val = 1.0 - audio_cond_strength
         audio_mask = torch.full((B, 1, T_a, F_s), audio_mask_val,
                                 device=audio_full.device, dtype=audio_full.dtype)
+
+        # IC references: injected LAST, after every other guide/keyframe has been
+        # placed, and before the AV combine — append_keyframe rejects a combined
+        # AV latent outright, so this only works on the video-only latent.
+        positive, negative, video_init = apply_ic_references(
+            self._add_latent_guide, vae, positive, negative, video_init,
+            get_ic_pack(positive) if getattr(self, '_ic_enabled', True) else None,
+            chunk_index=0,
+        )
+        # NB: T_v is deliberately NOT updated. It is the content length and drives
+        # the audio arithmetic; the reference tokens are out-of-band and must not
+        # enter it. video_init's own noise_mask was extended to cover them by
+        # append_keyframe, which is why the all-ones fallback below is skipped.
 
         video_has_mask = "noise_mask" in video_init and video_init["noise_mask"] is not None
         av_init = {"samples": self._combine_av(video_init["samples"], audio_init, ltxav)}
@@ -966,10 +1080,20 @@ class LTXVAVLoopingSampler:
         F_s = audio_acc.shape[3]
         dev, dty = audio_acc.device, audio_acc.dtype
 
-        a_overlap = _audio_overlap_frames(temporal_overlap, fps)
+        # SPEC_50FPS: every audio count is a DIFFERENCE of the global boundary
+        # map audio_pos(), never a chunk-local span. Local spans re-introduce
+        # LTX's first-frame asymmetry per chunk, which at 50 fps lands on x.5
+        # and rounds by parity (+-1 audio frame per boundary, cumulative).
+        #   a_overlap (= spec's a_carry) = audio_pos(ov)
+        #   a_new                        = audio_pos(e) - audio_pos(s)
+        # The invariant s >= ov (guaranteed by the short-prior clamp above)
+        # keeps the carry start non-negative; the min() is belt-and-braces.
+        a_end     = v_start + num_new_v          # global latent end of new content
+        a_overlap = audio_pos(temporal_overlap, fps)
         a_overlap = min(a_overlap, audio_acc.shape[2])
-        T_a_chunk = _audio_frames_for_video_chunk(T_v_chunk, fps)
-        T_a_new   = max(1, T_a_chunk - a_overlap)
+        a_new     = audio_pos(a_end, fps) - audio_pos(v_start, fps)
+        T_a_chunk = a_overlap + a_new
+        T_a_new   = max(1, a_new)
 
         # Carry-swap (SPEC_NEG_REF_AUDIO.md): fill the frozen carry slot with the
         # scheduled reference voice instead of the accumulator tail. The chunk
@@ -1037,6 +1161,16 @@ class LTXVAVLoopingSampler:
         self._debug_chunk(
             chunk_index, v_start, v_end - 1, T_v_chunk,
             a_start_global, a_start_global + T_a_chunk - 1, T_a_chunk, fps,
+        )
+
+        # IC references: same placement as chunk 0 — last, and pre-AV-combine.
+        # Re-injected per chunk by design: the tokens live in the chunk's own
+        # latent, so every chunk needs its own copy for identity to hold across
+        # boundaries. That is the entire reason for the pack transport.
+        positive, negative, video_init = apply_ic_references(
+            self._add_latent_guide, vae, positive, negative, video_init,
+            get_ic_pack(positive) if getattr(self, '_ic_enabled', True) else None,
+            chunk_index=chunk_index,
         )
 
         av_init = {"samples": self._combine_av(video_init["samples"], audio_init, ltxav)}
@@ -1337,6 +1471,36 @@ class LTXVAVLoopingSampler:
                   "a real video latent (V2A/v2v), or set video_cond_strength = 0 for "
                   "normal generation.")
 
+        # SPEC_50FPS: audio boundaries are exact only when 200/fps is an integer
+        # (audio_pos differences are then exactly (n-m)*q and roundings cancel).
+        # Other rates leave a sub-frame residue at every chunk boundary.
+        _q = 200.0 / float(video_fps) if video_fps > 0 else 0.0
+        if abs(_q - round(_q)) > 1e-9:
+            print(f"[LTXVAVLoopingSampler] WARNING: video_fps={video_fps} — audio "
+                  f"chunk boundaries are EXACT only at fps dividing 200 "
+                  f"(1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200). At {video_fps} "
+                  f"expect up to ~20 ms of per-boundary quantization; it does not "
+                  f"accumulate, but seams may drift against a conditioned track.")
+
+        # video_fps drives audio arithmetic; the model reads frame_rate off the
+        # conditioning. Disagreement is silent at render time — check up front.
+        self._check_frame_rate(guider, video_fps)
+
+        # SPEC_IC_REFERENCES §2.4: downscaled full-frame references have no
+        # correspondence to a spatial tile crop — each tile would be told "this
+        # is the whole subject" about a fragment. v1 skips rather than guesses.
+        self._ic_enabled = (horizontal_tiles * vertical_tiles) == 1
+        if not self._ic_enabled:
+            try:
+                if get_ic_pack(_get_raw_conds(guider)[0]) is not None:
+                    print("[LTXVAVLoopingSampler] WARNING: IC reference pack present "
+                          "but spatial tiling is active "
+                          f"({horizontal_tiles}x{vertical_tiles}) — references are "
+                          "SKIPPED. Full-frame references do not correspond to tile "
+                          "crops. Use a single tile to enable them.")
+            except Exception:
+                pass
+
         # Prior AV latent (video continuation): prepend the existing content to the
         # working latent and seed the accumulator with it, so generation continues
         # after it via the standard overlap mechanism. `latents` defines only the
@@ -1636,7 +1800,7 @@ class LTXVAVLoopingSampler:
         # overshoot T_v due to tile stride / clamp arithmetic.
         video_final = video_final[:, :, :frames, :, :]
         if audio_final is not None:
-            T_audio_target = _audio_frames_for_video_chunk(frames, video_fps)
+            T_audio_target = audio_pos(frames, video_fps)
             audio_final = audio_final[:, :, :T_audio_target, :]
 
         out = {"samples": self._combine_av(video_final, audio_final, ltxav)}
