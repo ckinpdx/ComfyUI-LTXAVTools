@@ -179,10 +179,9 @@ class LTXAVLatentCheck:
             T_v = int(samples.shape[2])
             T_a = 0
 
-        # Expected audio latents: pixel_frames / fps * audio_latents_per_second
-        # pixel_frames = (T_v - 1) * 8 + 1
-        pixel_frames = (T_v - 1) * 8 + 1
-        expected = round(pixel_frames / fps * self.AUDIO_LATENTS_PER_SECOND)
+        # SPEC_50FPS: global boundary map, not a local span (the old
+        # round(px/fps*25) form reports false mismatches at 50 fps).
+        expected = audio_pos(T_v, fps)
         delta = T_a - expected
         matched = delta == 0
 
@@ -223,8 +222,9 @@ class LTXAVSeparateCheck:
         T_v = int(video_latent["samples"].shape[2])
         T_a = int(audio_latent["samples"].shape[2])
 
-        pixel_frames = (T_v - 1) * 8 + 1
-        expected = round(pixel_frames / fps * self.AUDIO_LATENTS_PER_SECOND)
+        # SPEC_50FPS: global boundary map, not a local span (the old
+        # round(px/fps*25) form reports false mismatches at 50 fps).
+        expected = audio_pos(T_v, fps)
         delta = T_a - expected
         matched = delta == 0
 
@@ -645,16 +645,21 @@ class LTXLoraMetadataReader:
             },
         }
 
-    RETURN_TYPES = ("STRING", "FLOAT", "STRING")
-    RETURN_NAMES = ("lora_path", "latent_downscale_factor", "metadata")
+    # APPEND-ONLY: `factor_int` is deliberately LAST. ComfyUI links outputs by
+    # INDEX, so slotting it in beside the FLOAT would silently re-point every
+    # existing `metadata` link in saved workflows.
+    RETURN_TYPES = ("STRING", "FLOAT", "STRING", "INT")
+    RETURN_NAMES = ("lora_path", "latent_downscale_factor", "metadata", "factor_int")
     FUNCTION     = "read"
     CATEGORY     = "LTXAVTools/utils"
     DESCRIPTION  = (
         "Reads a LoRA's safetensors metadata header (no weight loading). Outputs "
         "the absolute path (wire to a loader's opt_lora_path so one combo drives "
-        "everything), the IC-LoRA reference_downscale_factor (wire to the AV "
-        "Looping Sampler's guiding_downscale_factor), and the full metadata for "
-        "inspection."
+        "everything), the IC-LoRA reference_downscale_factor as both FLOAT and INT, "
+        "and the full metadata for inspection. Use the FLOAT for the AV Looping "
+        "Sampler's guiding_downscale_factor and the IC References node; use "
+        "factor_int for INT-typed consumers such as LTXV Dilate Latent's "
+        "horizontal_scale / vertical_scale, which will not accept a FLOAT link."
     )
 
     def read(self, lora_name):
@@ -693,7 +698,7 @@ class LTXLoraMetadataReader:
         found = f"{src_key}={factor}" if src_key else f"no factor key (default {factor})"
         print(f"[LTXLoraMetadataReader] {lora_name}: {found} | "
               f"{len(md)} metadata keys")
-        return (path, factor, meta_str)
+        return (path, factor, meta_str, int(round(factor)))
 
 
 class LTXAVStreamingSave:
