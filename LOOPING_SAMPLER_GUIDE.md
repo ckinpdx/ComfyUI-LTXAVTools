@@ -83,6 +83,13 @@ widget says. The symptom is nasty precisely because nothing errors: the Latent C
 reports `delta 0` (the audio is correct *for the sampler's rate*) while the video is
 paced for 25 — it only looks right at 25 fps playback.
 
+**The second pass is where this actually bites.** Refinement/upscale passes
+usually build their own conditioning chain, and it is easy to carry over the text
+encode while forgetting `LTXVConditioning` — so pass 1 runs at the right rate and
+pass 2 silently drops to 25. Symptom: pass 1 is in sync, pass 2 loses lipsync at
+an unchanged denoise. (Observed 2026-07-27.) It is not the denoise, the overlap,
+or the scene schedule — check for the node first.
+
 The sampler checks this before sampling and warns if the conditioning carries no
 `frame_rate` while `video_fps ≠ 25`, if the two disagree (it prints the drift factor), or
 if the positive and negative branches are on different rates. A quiet console means the
@@ -103,6 +110,44 @@ second-pass `LTXVConditioning`. The latent carries no rate; it is interpretation
 way down.
 
 ---
+
+## 2b. Sub-1.0 guide strengths engage an attention mask
+
+**With `MultimodalGuider`, keep every guide strength at 1.0.** Below 1.0 you get artifacts
+and degraded generations — not a crash, just a worse result, which is the reason this is
+worth stating rather than leaving to be discovered.
+
+Two different mechanisms wear the word "strength" in this sampler, and only one of them
+touches attention:
+
+**Attention-mask family.** A guide below 1.0 registers an *attention entry* alongside its
+noise mask. That mask has to survive whatever attention backend is active: sageattn falls
+back to SDPA, some backends drop it silently, and `MultimodalGuider`'s extra per-modality
+passes appear not to carry it correctly at all. You can identify these from the console —
+they are exactly the knobs that print a line like:
+
+```
+guide appended: 5 latents (10x18) at latent_idx 0 (frame_idx 0) strength 0.3
+```
+
+Any `strength` below 1.0 in that line is an attention entry. In practice that covers
+`guiding_strength`, `cond_image_strength` (for indices other than 0 — index 0 is written
+in-place and never appends), `optional_negative_index_strength`, `temporal_overlap_cond_strength`,
+and the IC reference nodes' `strength`.
+
+**Sampling-loop family — safe.** `audio_cond_strength`, `video_cond_strength`,
+`optional_denoise_mask` and `optional_audio_denoise_mask` are applied by blending in the
+sampling loop, never as attention masks. They are kernel-agnostic and guider-agnostic, so
+they behave the same under `MultimodalGuider` as under `CFGGuider`.
+
+**If you need a partial guide under `MultimodalGuider`:** window it in TIME rather than
+weakening it — keep the strength at 1.0 and use `guiding_start_step` / `guiding_end_step`.
+That expresses "partly guided" without ever creating a mask. The alternative is to sample
+with a plain `CFGGuider`, which handles sub-1.0 strengths correctly and costs you only the
+per-modality CFG split.
+
+Related but distinct: the same combination can also *crash* rather than degrade — see the
+`expanded size of tensor` row in §13.
 
 ## 3. Continuity levers (the sync-critical pair)
 
@@ -341,6 +386,31 @@ simpler and sufficient.
 ---
 
 ## 6. Audio levers
+
+### `optional_audio_denoise_mask`
+
+The audio counterpart to `optional_denoise_mask`. Unconnected, audio follows the video
+mask via a derived profile — a video span freed for regeneration frees its audio too.
+Connect this to break that coupling: re-dub a span while the picture stays frozen, or
+the reverse. **LTX AV Time Range Mask** builds either from time ranges (`"2-4, 7-9.5"`).
+
+`audio_cond_strength` and these masks are different mechanisms and the analogy between
+them only goes so far. The strength is a single scalar over the whole audio track; the
+masks are per-span. Mid-range strengths are not a usable middle ground the way a partial
+video denoise is.
+
+### Short input audio
+
+If the input audio is shorter than the timeline, chunks **zero-pad** it — they never
+shorten to match, because `T_a == audio_pos(T_v, fps)` is the invariant the whole
+boundary map rests on. (Chunk 0 used to clamp instead, which desynced every downstream
+length; fixed in 1.6.0.)
+
+Padding is not free: **a zero audio latent is out of distribution and decodes to a hum,
+not silence.** At high `audio_cond_strength` those zeros are frozen, so the hum lands in
+the output. The sampler warns up front with the shortfall in seconds and whether your
+strength will freeze it. Use the Cut Marker's `start_seconds` / `duration_seconds` to
+load exactly the scheduled region.
 
 ### `audio_cond_strength`
 
@@ -611,6 +681,7 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Gibberish generated speech over a guide video (changing the words) | the guide's visible lips out-muscle the text via v2a — set `v2a_cross_attn = False` on the **LTX AV Cross-Attention Toggle** node. Text drives the audio; a2v resyncs the mouth. Only bites during generation; irrelevant with input audio. |
 | Lips move during silence over a guide video | the guide's original lip motion bleeds through where the new audio is silent — fill the runtime with dialog (no dead air), and/or free the mouth more (higher CrossView regeneration, lower guide/overlap strength) so a2v dominates it. |
 | Crash: `expanded size of tensor … must match` inside attention, with MultimodalGuider | STG perturbed pass × any sub-1.0 guide strength (incl. `cond_image_strength 0.5`) breaks core's guide-mask attention. Set `perturb_attn=false`/`stg=0` in GuiderParameters (keeps per-modality CFG), or keep all guide strengths at 1.0 and window via `guiding_start/end_step` |
+| Artifacts / degraded generations (no error) with MultimodalGuider | Any sub-1.0 GUIDE strength — it registers an attention entry the guider's extra passes mishandle. Keep guide strengths at 1.0 and window via `guiding_start/end_step`, or sample with `CFGGuider`. Sampling-loop levers (`audio_cond_strength`, denoise masks) are unaffected — see §2b |
 | Crash: `guide pre_filter_counts != keyframe grid mask length` | stale guide conditioning — either an upstream guide node (LTXVAddGuide / IC-LoRA guide) or a cached cond polluted across queue runs. The sampler now **auto-strips** guide bookkeeping on entry (prints `stripping stale guide conditioning …`) and no longer memoizes onto the cached guider, so this should be fixed. If it still fires, note what the strip message names and report it; references go through `optional_guiding_latents` only |
 | Inpaint: masked region unchanged, or whole frame drifts | `optional_denoise_mask` — unchanged = polarity inverted (white must be the regen region; check the `N% kept` console line) or the mask isn't reaching the model; whole-frame drift = mask absent so nothing is pinned. Needs real video in the input latent (§5b) |
 | Inpaint fill looks pasted-on / large hole invents wrong structure | base model has too little surrounding context — switch to the IC-LoRA route (LTX Inpaint Color Fill + inpaint LoRA, §5b fallback) |

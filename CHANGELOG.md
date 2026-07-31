@@ -1,5 +1,261 @@
 # Changelog
 
+## 1.7.0 - 2026-07-30
+
+### Added
+- **LTX AV Add IC References (Multi)** — per-speaker IC-LoRA references, the
+  visual counterpart to `LTXAVReferenceAudioMulti`. `reference_images_n` are
+  injected only on chunks tagged `[SPEAKER n]`; `all_chunks_images` (a
+  background plate) go into every chunk and are merged AFTER the selected
+  speaker's views, keeping the tail slot a hand-built batch conventionally
+  gives them — MSR is positional, so that is not cosmetic.
+
+  Two wins over sending every character's views to every chunk: the prompt
+  stops being the only thing arbitrating who is on screen (a wardrobe phrase is
+  a weak handle against a face the model can see), and reference tokens — which
+  are paid PER CHUNK — drop with the number of views. Two characters at 4 views
+  plus a background is 9 views a chunk unscheduled, 5 scheduled.
+
+  An untagged chunk gets EVERY speaker's views, not just the shared plate: no
+  tag means we do not know who is on screen, and an establishing shot may hold
+  everyone. A tagged chunk with no matching bank entry warns and falls back.
+
+### Changed
+- The encode path is now shared. `LTXAVAddICReferences` and the Multi node call
+  one `encode_reference_pack()`, so the grid math, the 8n+1 truncation assert
+  and the token accounting exist in exactly one place. The single node's
+  behaviour and widgets are unchanged.
+- Packs merge along the time axis into ONE guide append rather than several —
+  cheaper, and it keeps a single deterministic slot order. Packs built for
+  different geometry are refused with a message naming both, instead of
+  producing an opaque shape error later.
+
+## 1.6.1 - 2026-07-30
+
+### Fixed
+- **The looping sampler destroyed the base conditioning after chunk 0.**
+  `_prepare_guider` did `new_g = copy.copy(guider)` — a SHALLOW copy, so
+  `new_g.original_conds` was the *same dict object* as the incoming guider's, and
+  `CFGGuider.set_conds` assigns into it. Chunk 0's `set_conds` therefore
+  overwrote the real base conditioning, and every later chunk read chunk 0's own
+  per-chunk conds back as "base". `new_g` now gets its own `original_conds` dict.
+
+  Blast radius: ANY conditioning-level key set upstream that the sampler does not
+  explicitly re-carry per chunk was silently lost from chunk 1 onward. The keys
+  that are carried (`ref_audio`, `frame_rate`, `ic_reference_pack`) appeared to
+  work only because chunk 0 handed them back on the next read.
+
+  The symptom that exposed it: per-chunk `[SPEAKER n]` voice switching never
+  fired — `LTXAVReferenceAudioMulti`'s `ref_audio_bank` is not carried per chunk,
+  so it vanished with chunk 0's `set_conds` and every tagged chunk silently fell
+  back to the default voice.
+
+### Added
+- When a `[SPEAKER n]` chunk falls back to the default voice, the log now says
+  WHY — bank key absent (with a dump of the keys actually present on the guider's
+  conditioning) vs bank present but empty. The first distinguishes a wiring
+  problem from a node problem; the key dump is what located the bug above.
+
+## 1.6.0 — 2026-07-30
+
+### Fixed
+- **Chunk 0 no longer clamps the audio length — it pads, like the extend chunks
+  already did.** `T_a` now stays `audio_pos(T_v, fps)` unconditionally; a short
+  input audio track is zero-padded rather than shortening the chunk. Clamping
+  broke the invariant the whole boundary-map scheme rests on (`T_a ==
+  audio_pos(T_v, fps)`) and made chunk 0 the only builder that disagreed with
+  the rest. Verified delta 0 across empty / exact / short / long / 50 fps.
+- **Warns when the input audio is shorter than the timeline**, naming the
+  shortfall in seconds and whether `audio_cond_strength` will freeze the padded
+  zeros. A zero audio latent is out-of-distribution — it decodes to a hum, not
+  silence — so at high strength the hum is baked into the output with nothing
+  else to indicate it.
+
+### Changed
+- **`audio_cond_strength` is now a mask control only.** The audio init is seeded
+  from the input latent whenever input audio exists, independent of the
+  strength — matching video, where `video_init` always holds the input and the
+  mask decides what regenerates. Previously one scalar set both, which made
+  "input audio as init WITH a free span" inexpressible, i.e. exactly what a
+  video denoise mask does by default. `LTXVEmptyLatentAudio` returns zeros, so
+  free-generation paths (including the ID-LoRA's) take the same branch as before.
+
+### Added
+- **`optional_audio_denoise_mask`** — overrides the audio profile that is
+  otherwise derived from `optional_denoise_mask`, for the case where the two
+  modalities genuinely should differ (re-dubbing a span while the video stays
+  untouched). Unconnected, audio follows video as before.
+- **LTX AV Time Range Mask** — denoise mask from time ranges ("2-4, 7-9.5"),
+  reporting the latent and audio spans the range actually snaps to.
+- **Cut Marker: `start_seconds` / `duration_seconds` outputs** (appended) for
+  audio loaders — the scheduled window in seconds, so `VHS_LoadAudio`'s
+  `seek_seconds` / `duration` cover exactly the scheduled region.
+
+## 1.5.0 — 2026-07-28
+
+### Added
+- **Temporal AUDIO masking in the AV Looping Sampler.** The audio mask was
+  authored from two scalars (`audio_cond_strength` / `audio_overlap_cond_strength`)
+  and so could only be uniform or split at the overlap — there was no way to say
+  "freeze this span of audio, regenerate that one". It is now modulated by a
+  per-frame profile **derived from the video denoise mask**, never authored
+  separately, so the two modalities cannot disagree about where a frozen span is.
+  - Mapping is the boundary map: video latent `t` owns audio
+    `[audio_pos(t), audio_pos(t+1))`, with `audio_pos(0)` taken as 0 — latent 0
+    owns one audio frame, every later latent owns `q = 200/fps`. Spatial
+    reduction is MAX: if any part of a video frame regenerates, its audio does
+    too. Verified exact at 25 and 50 fps.
+  - Composed by MULTIPLICATION, so the profile can only ever freeze. The
+    strength scalars still govern how hard input audio is held wherever the
+    profile leaves it free, and the overlap carry keeps its own behaviour.
+  - This is what makes temporal AV inpainting expressible — freeze A and B,
+    regenerate the span between them, audio included.
+- **Input validation on every clip node** (Join / Compose / Trim).
+  - **fps is read from the clips and the LOWEST wins (`fps = 0`, the default).**
+    Audio runs at 25 latents/second regardless of video rate, so
+    `audio_pos(T_v, fps) == T_a` pins each clip's rate — `infer_av_fps` asks the
+    clip instead of trusting a widget. Joining 24 + 25 resolves to 24 with no
+    comparison nodes in the graph.
+    - **Video is never touched** — a clip is T latents whatever rate you call
+      it. Only the audio is retimed, by linear interpolation of the latent
+      sequence, which is the latent-domain equivalent of a time stretch (~4%
+      for 24↔25). Reported on every use; it is an approximation, not a
+      resampler.
+    - Candidate ORDER is preference, because short clips fit more than one rate.
+      Without it a 24 fps clip resolves to **23.976** and every downstream
+      duration inherits the drift — found in testing.
+  - **fps was ALSO the source of an off-grid bug.** Bridge Compose allocated
+    section audio as `k * q`, which only holds when `q = 200/fps` is an integer
+    — so it broke at 24 fps. Now every section is a DIFFERENCE of `audio_pos`,
+    which telescopes to the exact total at any rate (SPEC_50FPS's principle,
+    applied where I had missed it).
+  - **fps was verified against the clip itself, not trusted.** Audio runs at 25
+    latents/second regardless of video rate, so `audio_pos(T_v, fps) == T_a`
+    pins the rate — each clip is *asked* what it is (`infer_av_fps`). Feeding
+    50 fps clips with fps set to 25 now fails immediately, naming the detected
+    rate, instead of silently scaling everything by 2. Unique for any clip of
+    realistic length; ambiguous only below ~5 latents between near-identical
+    rates (23.976/24, 48/50). Desynced streams that match no standard rate are
+    reported as such.
+  - **Resolution is reconciled, aspect is not.** Joining clips at different
+    RESOLUTIONS is the normal case — the same shot at two sizes, a stage-1 and a
+    stage-2 output — so matching aspects downscale to the smallest automatically
+    (`on_size_mismatch`, default `downscale_to_smallest`, set `error` to refuse).
+    Differing ASPECT always errors: there is no correct answer without cropping
+    or letterboxing, and both change the framing, so it stays the operator's
+    call. Tolerance 2% absorbs latent-grid rounding.
+    - The target is the smallest clip's OWN grid, not (min height, min width)
+      independently, which could otherwise synthesise a grid matching no clip's
+      aspect.
+    - Latent-grid resampling is lossy and says so on every use — decode, resize
+      in pixel space and re-encode when the detail matters.
+  - **Manual fps still validates.** Setting a rate explicitly checks every clip
+    against it and errors naming the detected rate, so a wrong widget can't
+    silently scale the result.
+- **LTX AV Bridge Compose / LTX AV Bridge Extract** — a generated transition
+  with BOTH boundary conditions as real AV.
+  - Compose emits `[A_tail | free bridge | B_head]` plus its denoise mask.
+    Audio allocation keeps **both seams exact** — A_tail end-aligned,
+    B_head start-aligned — pushing the unavoidable first-frame discrepancy to
+    the composite's outer edges, which are frozen context.
+  - Extract discards the scaffolding tails and rejoins the bridge between the
+    **original full-resolution** clips, deliberately keeping one extra head
+    latent so Join has a stub to consume and no bridge content is lost.
+  - The `plan` handoff (`LTXAV_BRIDGE_PLAN`) carries the section counts, so all
+    latent cutting stays internal to the nodes.
+  - Supersedes **Bridge Prep**'s approach of pinning B with a single still: the
+    bridge now meets B's actual motion and audio at generation time rather than
+    at the refinement pass.
+
+## 1.4.0 — 2026-07-28
+
+### Added
+- **LTX AV Trim Latents** — keep or drop a span from either end of an AV latent,
+  slicing audio to match via `audio_pos`. Modes `keep_head` / `keep_tail` /
+  `drop_head` / `drop_tail`, in seconds or exact latents. Head slices are exact
+  (they keep latent 0, the genuine video-start latent); tail slices are aligned
+  at their END, where a join or continuation happens.
+  - Needed for the second-pass composite (`A_tail | bridge | B_head`) and for
+    isolating a bridge from a sampler's prior+bridge output. 1.3.0 shipped
+    `a_tail_seconds` without it, so that path dead-ended.
+- **Bridge Prep: `trim_prior_latents` output** (appended). Slices have no stub
+  latent, but Join drops one from every clip after the first — so trimming the
+  prior off *exactly* would eat a latent of bridge. This value is
+  `prior_latents - 1`, deliberately leaving the prior's final latent in place so
+  Join has a stub to drop and the bridge survives whole. Verified end to end:
+  identical final length at every `a_tail_seconds`, at 25 and 50 fps, with clip
+  A and clip B content intact at the ends.
+
+## 1.3.1 — 2026-07-27
+
+### Fixed
+- **Cut Marker: `emit_fps` driven by a link is now resolved in the timeline
+  panel.** A linked widget's `.value` goes stale — the frontend never sees what
+  the backend will resolve — so the panel previewed at the widget's old rate
+  while the run used the link's. Since `scene_lengths` are pixel frames, that
+  scaled every scene silently. The panel now walks one hop upstream (through
+  Reroutes) and reads the value when the source is a literal.
+  - **Only literal sources are trusted** (`Primitive` / `*Constant` / `Int` /
+    `Float`). Reading "the first positive number" off an arbitrary node would
+    return a step count or a seed and report it as the frame rate; a confident
+    wrong answer is worse than an honest one. A computed source is reported as
+    unresolved in the readout, with the rate the panel is previewing at.
+  - The rate is now re-resolved on draw / readout / schedule-sync rather than
+    only in the widget callback, so a linked rate is picked up without a
+    callback ever firing — and a change re-anchors the start/end markers via
+    the same path added in 1.2.1.
+  - **Also re-resolved at queue time**, via `serializeValue` on the
+    `scene_lengths` widget. Nothing in the panel runs while idle — draw and
+    readout fire only on pointer/key/playback events — so changing a linked
+    rate and hitting Run *without touching the timeline* would otherwise
+    serialize a schedule built at the old rate. `scene_lengths` is widget 1 and
+    `start_frame` is widget 3, so the re-sync's `start_frame` update lands
+    later in the same serialization pass.
+
+## 1.3.0 — 2026-07-27
+
+### Added
+- **LTX AV Join Latents** — concatenates 2-4 AV latents with the first-frame
+  correction. A plain `cat` is wrong by a CONSTANT `+7` pixel frames and `+1`
+  audio latent per join: clip B's latent 0 was encoded as a video start holding
+  one pixel frame and decodes as eight mid-sequence. Dropping each subsequent
+  clip's stub video latent and first audio latent gives `joined_T = ST - (N-1)`,
+  and the total is reconciled against `audio_pos(T, fps)` rather than trusted.
+  Verified exact for 2/3/4 clips at 25 and 50 fps.
+  - Emits a temporal `region_mask` (`free_clips` + `mask_feather`) for refining
+    one clip in place — the second-pass lever for bridges.
+- **LTX AV Bridge Prep** — stages a generated transition between two clips.
+  Head pinned by real AV via `optional_prior_av_latent`, tail by clip B's first
+  frame at index `-1`. LTX already does the bridging; this only assembles the
+  tensors. `a_tail_seconds` defaults to 2.0 (`0` = all of A).
+  - Tail slices are aligned at their END: a mid-sequence latent owns 8 audio
+    frames but a standalone clip's latent 0 owns 1, so any slice carries a
+    surplus. Taking the last `audio_pos(k)` frames puts that discrepancy at the
+    prior's head (discarded context) instead of at the seam.
+
+## 1.2.1 — 2026-07-27
+
+### Fixed
+- **Cut Marker: start/end markers now follow wall-clock when `emit_fps`
+  changes.** Cuts store a time (`c.t`) and re-anchor for free, but `startLat`
+  and `endLat` are **latent indices** and were left untouched by the fps
+  callback — so switching 25 -> 50 doubled the timeline under them and both
+  markers silently landed at *half* their former time. With an end marker set
+  that clamped the whole schedule to the first half of the video, with no
+  error. The callback now snapshots both markers' times at the OLD rate and
+  converts them back at the new one, alongside the existing cut re-snap.
+  Verified: 25 -> 50 -> 25 round-trips to the exact original latent indices,
+  and wall-clock is held to within one latent (the grid resolution).
+  - Unaffected: graphs with no start/end marker were already correct, since
+    cuts were always time-anchored.
+- **Stale fps docs corrected.** The `emit_fps` tooltip and the Scene Length
+  Calculator's `fps` row both asserted 25 as *the* LTX AV rate; both now state
+  that they must equal the sampler's `video_fps`, and that a mismatch halves or
+  doubles every scene silently. The tiled upsampler section claimed temporal
+  (50 fps) output was "single-shot refinement only (the AV Looping Sampler's
+  audio math is 25 fps)" — untrue since the `audio_pos` refactor, and now
+  documents the round-trip including the `frame_rate` conditioning requirement.
+
 ## 1.2.0 — 2026-07-27
 
 ### Added

@@ -41,7 +41,7 @@ Authors variable scene lengths for the AV Looping Sampler. Takes scene durations
 | Input | Description |
 |---|---|
 | `scene_seconds` | Scene durations in seconds, `\|` or `,` separated — one per chunk/prompt segment |
-| `fps` | Frames per second (25 for AV) |
+| `fps` | Frames per second — **must equal the sampler's `video_fps`**. `scene_lengths` are pixel frames, so authoring at 25 for a 50 fps pipeline silently halves every scene (and vice versa). It does not error. |
 
 **Outputs:** `scene_lengths`, `frame_count`, `scene_count`, `info`, `actual_seconds`
 
@@ -50,7 +50,7 @@ Authors variable scene lengths for the AV Looping Sampler. Takes scene durations
 ### LTX Video Cut Marker (Scenes)
 Interactive timeline widget for authoring a scene schedule against real media. Load a **video or audio file** (picker, upload button, or drag-and-drop) — audio files show a **waveform** on the timeline (videos show their soundtrack's waveform too), so scenes can be cut against a song's sections visually. Cuts mark scene boundaries, hard-snapped to the LTX latent grid; an optional **end marker** (red, `E`) truncates the schedule, and an optional **start marker** (blue, `S`) trims the head — the schedule is then measured across the `[start, end]` window.
 
-Indices are **time-anchored and emitted in `emit_fps` frame space** (default 25): a 24fps source marked while emitting at 25 — the VHS `force_rate` case — produces a schedule in the *pipeline's* frame space, not the file's.
+Indices are **time-anchored and emitted in `emit_fps` frame space** (default 25): a 24fps source marked while emitting at 25 — the VHS `force_rate` case — produces a schedule in the *pipeline's* frame space, not the file's. **`emit_fps` must equal the sampler's `video_fps`** — the schedule is in pixel frames, so emitting at 25 for a 50 fps pipeline halves every scene's duration, silently. Everything below the time conversion is latent-space and rate-independent; this one widget is the whole fps dependency.
 
 An **auto-cut** control (interval box + ⚡ button) replaces all cuts with one every N seconds, grid-snapped, from the start marker to the end. Loading **new media** resets the schedule (the workflow-restore path is untouched, so a page refresh still restores saved state).
 
@@ -63,6 +63,7 @@ Controls: double-click / `C` = add cut · drag = move (snapped) · click = selec
 | `video_path` | → VHS Load Video (Path); this node does not decode |
 | `frame_load_cap` | = `frame_count` — cap the upstream loader to exactly the scheduled frames |
 | `skip_first_frames` | Start marker's pixel-frame offset → VHS loader's `skip_first_frames` (0 = from the start) |
+| `start_seconds` / `duration_seconds` | The same `[start, end]` window in SECONDS, for an AUDIO loader (`VHS Load Audio`'s `seek_seconds` / `duration`) — so the loaded audio covers exactly the scheduled region. Appended last: ComfyUI links outputs by INDEX, so inserting them would re-point every existing link. |
 
 ### LTX Keyframe Planner
 Turns a `scene_lengths` schedule into **end-anchored keyframe indices** for keyframe-travel generation: frame `0` opens (optional), each scene travels to a keyframe at **its own end** — landing in its own chunk so generation converges on the image and the next scene inherits through the overlap carry — and the final scene closes on `-1` (optional). `128|128|96` → `0,120,248,-1`.
@@ -199,6 +200,86 @@ Not a valid input for the AV Looping Sampler — the dummy video component would
 
 **Outputs:** `latent` (AV NestedTensor), `audio_latent_frames`
 
+### LTX AV Source Match
+Matches a source clip's dimensions and rate to the generation you are joining it to, reporting what it inferred rather than assuming. `infer_av_fps` recovers a clip's rate from its OWN video:audio latent ratio, so a 24 fps source dropped into a 25 fps pipeline is caught here instead of silently drifting.
+
+**Outputs:** `latent`, `width`, `height`, `fps`, `info`
+
+### LTX AV Bridge Compose
+Builds the sampler input for a **generated bridge** between two clips: A's tail, a noise span the model fills, then B's head — one latent, one pass, with the mask that frees only the middle.
+
+The audio arithmetic here is the part that has to be exact. Section lengths are **differences of `audio_pos`**, never `k * q`:
+
+```python
+a_take = audio_pos(k_a, fps)
+c_take = audio_pos(k_a + k_c, fps) - a_take
+b_take = audio_pos(T, fps)         - audio_pos(k_a + k_c, fps)
+```
+
+`k * q` is only correct when `q = 200/fps` is an integer — true at 25 and 50 fps, wrong at 24, where it silently mis-sizes every section. Differences telescope, so the rounding term cancels and the sections always sum to the whole.
+
+| Input | Description |
+|---|---|
+| `latent_a`, `latent_b` | the clips to bridge |
+| `bridge_seconds` | length of the generated span |
+| `context_seconds` | how much of A's tail and B's head to carry as frozen context |
+| `fps` | must match the rate both clips were generated at |
+
+**Outputs:** `latent`, `denoise_mask`, `info`
+
+### LTX AV Bridge Extract
+Pulls the finished bridge back out of a composed pass, keeping **one extra head latent** so `LTX AV Join Latents` has the stub it expects to consume. Extracting the exact span instead would make the join short by one latent per side — the same off-by-one the Join node exists to fix.
+
+**Outputs:** `latent`, `info`
+
+### LTX AV Join Latents
+Concatenates 2–4 AV latents end to end. **A plain `cat` is wrong by a constant amount every time** — `+7` pixel frames and `+1` audio latent per join — because clip B's latent 0 was encoded as a video *start* holding one pixel frame, but decodes as eight once it sits mid-sequence. That surplus is the same "first frame flash" people trim by hand; this does it exactly.
+
+The fix is to drop each subsequent clip's stub video latent and its first audio latent, giving `joined_T = ΣT − (N−1)`. The result is then reconciled against `audio_pos(T, fps)` rather than trusted, so a clip whose own audio was short can't poison the total silently.
+
+| Input | Description |
+|---|---|
+| `latent_1`, `latent_2` (+ `3`, `4`) | AV latents, matching resolution and channels |
+| `fps` | must match the rate the clips were generated at |
+| `free_clips` | 1-based indices to mark **white** in `region_mask` (e.g. `2`) |
+| `mask_feather` | pixel frames of ramp each side of a freed region |
+
+**Outputs:** `latent`, `region_mask`, `info`
+
+`region_mask` is the second-pass lever: join `A_tail | C | B_head`, free clip `2`, and wire the mask to the sampler's `optional_denoise_mask` to refine only the middle while A and B stay frozen.
+
+### LTX AV Trim Latents
+Keeps or drops a span from either end of an AV latent, slicing the audio to match via `audio_pos`.
+
+| Input | Description |
+|---|---|
+| `mode` | `keep_head` (clip B's opening) · `keep_tail` (clip A's closing) · `drop_head` (strip a bridge pass's prior span) · `drop_tail` |
+| `amount` / `units` | seconds, or exact `latents` when undoing a known count |
+| `fps` | must match the rate the clip was generated at |
+
+**Outputs:** `latent`, `latent_count`, `info`
+
+Head slices are exact — they keep latent 0, the genuine video-start latent. Tail slices are aligned at their **end**, because that's where a join or continuation happens; the small first-frame surplus lands at the slice's head instead of at the seam.
+
+> **Slices have no stub latent, but Join drops one from every clip after the first.** So a slice you intend to rejoin should keep one extra latent at its head for Join to consume. Bridge Prep's `trim_prior_latents` output does this for you.
+
+### LTX AV Bridge Prep
+Stages a **generated transition** between two clips. The head is pinned by real AV — motion *and* audio — via `optional_prior_av_latent`; the tail is pinned by clip B's first frame at index `-1`. LTX does the bridging; this node just assembles the tensors.
+
+| Input | Description |
+|---|---|
+| `clip_a` / `clip_b` | outgoing / incoming AV latents |
+| `vae` | decodes B's first frame (its latent 0 *is* the video-start latent, so it decodes to exactly one frame) |
+| `bridge_seconds` | length to generate. Short is easier — the model must arrive at a fixed frame, and every extra second is more room to drift first |
+| `a_tail_seconds` | how much of A to feed as context (default 2.0; `0` = all of A) |
+| `fps` | must match the sampler's `video_fps` **and** that pass's `LTXVConditioning` `frame_rate` |
+
+**Outputs:** `prior_av_latent` → `optional_prior_av_latent` · `bridge_latent` → `latents` · `end_image` → `optional_cond_images` · `cond_indices` (`"-1"`) → `optional_cond_image_indices` · `info`
+
+The tail slice is aligned at its **end**, because that's where the continuation happens. A mid-sequence latent owns 8 audio frames while a standalone clip's latent 0 owns 1, so any slice carries a small surplus — taking the last `audio_pos(k)` frames puts that at the prior's head, which is discarded context, instead of at the seam.
+
+**Half-res pipelines:** don't try to make an independently-upscaled bridge match. Generate C at half res with downscaled A/B as scaffolding, then composite C back between the **original full-res** A and B and run the refinement with those frozen (Join + `region_mask`). The model reconciles C against the genuine neighbours rather than guessing at them — the same base-model inpainting you already use spatially, rotated onto time.
+
 ### LTX AV Extend Latent
 Prepares an AV NestedTensor for extending existing content. Appends zero latents (video plus time-matched audio) for the extension region and pre-builds the noise mask: `existing_denoise` over the existing frames (0.0 = fully preserve), 1.0 over the new region.
 
@@ -240,22 +321,20 @@ Removes `ref_audio` from conditioning after sampling. Pair with LTX Add Audio La
 
 ### LTX AV Reference Audio Multi (ID-LoRA)
 
-> **⚠️ ABANDONED (2026-07-15) — multi-voice does not work.** The ID-LoRA's `ref_audio` is attended *globally* by every audio frame and the identity-guidance pass amplifies it *globally*, so it is **inherently single-voice**; per-chunk reference switching cannot localize a single global voice, and multi-speaker runs degrade (garbled onsets, wrong-speaker bleed). The node is kept as a record and remains a valid **single-reference** drop-in for the core `LTXVReferenceAudio` (speaker 1 only). For real multi-voice, see [SPEC_NEG_REF_AUDIO.md](SPEC_NEG_REF_AUDIO.md) (negative-index reference audio — specced, not built) and the ABANDONED header in `nodes/speaker_ref.py` for the full reasoning.
+Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four reference voices (~5 s clean clips). Speaker 1 is applied as the default `ref_audio` and the identity-guidance model patch is identical to the core node — with a single reference this is a drop-in replacement. All encoded voices are attached to the positive conditioning as a `ref_audio_bank`, which the looping sampler resolves per chunk against the `[SPEAKER n]` tag.
 
-Multi-speaker version of the core `LTXVReferenceAudio` node. Encodes up to four reference voices (~5 s clean clips). Speaker 1 is applied as the default `ref_audio` and the identity-guidance model patch is identical to the core node — with a single reference this is a drop-in replacement. All encoded voices are attached to the positive conditioning as a `ref_audio_bank` (the multi-voice path the sampler *would* read — non-functional per above).
+> **Working as of 2026-07-30 (v1.6.1).** This section previously carried an ABANDONED notice calling multi-voice architecturally impossible. That was a false negative: the bank never reached the sampler (a shallow-copy bug let chunk 0 overwrite the base conditioning), so every chunk silently used speaker 1 and the "multi-speaker runs degrade" evidence was never a test of multi-voice. Chunks now log `ref=bank` and the voice switches. How cleanly two voices separate is still measured per run — the ID-LoRA was trained to carry one voice across a clip — but the routing is real.
 
 | Input | Description |
 |---|---|
 | `model`, `positive`, `negative` | passed through (model cloned + patched) |
 | `audio_vae` | LTXV audio VAE |
 | `reference_audio_1` | Speaker 1 — default voice (required) |
-| `reference_audio_2..4` | Additional speakers (optional — non-functional, see above) |
+| `reference_audio_2..4` | Additional speakers (optional) — selected per chunk by `[SPEAKER n]` |
 | `identity_guidance_scale` | Extra no-reference pass per step amplifies speaker identity; 0 disables |
 | `start_percent` / `end_percent` | Sigma range where identity guidance is active |
 
 ### LTX AV Speaker Prompt Provider
-
-> **⚠️ ABANDONED (2026-07-15)** — the per-chunk `[SPEAKER n]` routing half of the abandoned multi-voice ID-LoRA approach above. Kept as a record; not a working multi-voice path.
 
 `MultiPromptProvider` with voice routing for multi-speaker ID-LoRA generation. Splits prompts on `|` (one per temporal chunk). Segments using `[SPEAKER n]:` in place of `[SPEECH]:` select voice *n* from the reference bank for that chunk; the tag is rewritten to `[SPEECH]:` **before** encoding, so the model only ever sees its trained format. Untagged segments use the default voice. One speaker per chunk — turn-based dialog only.
 
@@ -335,6 +414,47 @@ Resamples a sigma schedule to a different step count while preserving its essent
 
 **Output:** `SIGMAS`
 
+### LTX AV Add IC References (Multi)
+
+Per-speaker IC-LoRA references — the visual counterpart to **LTX AV Reference Audio Multi**. `reference_images_n` are injected only on chunks tagged `[SPEAKER n]`; `all_chunks_images` go into every chunk.
+
+Two reasons this beats sending every character's views to every chunk:
+
+- **Identity.** With both characters' views present in every chunk, the prompt is the only thing arbitrating who is on screen — and a wardrobe phrase is a weak handle against a face the model can see. Sending one character's views removes the ambiguity instead of describing around it.
+- **Cost.** References are appended to *every* chunk, so their token cost is paid per chunk. Two characters at 4 views plus a background is 9 views a chunk unscheduled, **5** scheduled.
+
+| Input | Description |
+|---|---|
+| `reference_images_1` | Views for `[SPEAKER 1]` (required) |
+| `reference_images_2..4` | Views for speakers 2–4 (optional) |
+| `all_chunks_images` | Injected on every chunk regardless of speaker — the background plate (optional) |
+| `width` / `height` | GENERATION dimensions, not the reference's |
+| `strength`, `latent_downscale_factor`, `layout`, `crop` | as the single node |
+
+Selection per chunk:
+
+| chunk | gets |
+|---|---|
+| `[SPEAKER n]` | speaker *n*'s views + all-chunks views |
+| untagged | **every** speaker's views + all-chunks views |
+| `[SPEAKER n]` with no bank entry | all-chunks views only, with a warning |
+
+An untagged chunk gets everyone because no tag means we do not know who is on screen — an establishing shot may hold both. Narrowing to the shared plate would leave it with no identity at all.
+
+All-chunks views are merged **after** the selected speaker's, keeping the tail slot a hand-built batch conventionally gives them. MSR is positional, so that ordering is not cosmetic. Packs merge into one guide append; packs built for different geometry are refused by name rather than failing as a shape error later.
+
+> Like the single node, this does nothing on a stock sampler — the bank is inert until the looping sampler selects from it.
+
+### LTX AV Reference Audio Bank (Carry-Swap)
+Banks reference audio for the sampler's carry-swap path, where a chunk's frozen audio carry is replaced with a different speaker's reference before the next chunk samples. Distinct from **Reference Audio Multi**, which routes the ID-LoRA's `ref_audio` — this one operates on the carried latent itself.
+
+### LTX AV Time Range Mask
+Builds a denoise mask from time ranges (`"2-4, 7-9.5"`), reporting the latent and audio spans a range actually snaps to. Wire to `optional_denoise_mask` to regenerate only those spans, or to `optional_audio_denoise_mask` to free the audio while the video stays frozen.
+
+### LTX Noise Fill (pixel removal)
+Fills a masked pixel region with noise before encoding, for removal/inpaint work. Masks are resampled **bilinear** on the way up to image resolution (the opposite direction from mask→latent downscale, which uses `adaptive_max_pool2d` so a latent cell counts as masked if the mask touches it at all).
+
+
 ---
 
 ## Utility Nodes
@@ -345,7 +465,7 @@ AV-aware wrapper around the LTX latent upscale model. Upsamples the video compon
 ### LTX AV Latent Upsampler (Tiled)
 Temporally tiled variant: overlapping temporal tiles are upsampled on GPU and blended back with a linear crossfade. Viable when the result feeds a low-sigma refinement pass, which smooths residual tile-statistics differences. Use the non-tiled version when exact full-tensor statistics matter.
 
-**Supports both spatial and temporal upscalers — auto-detected** from the first tile's output shape (`L → L` spatial; `L → 2L−1` temporal, per the first-frame asymmetry: the LTX temporal upsampler doubles the pixel timeline, so `T` latents become `2T−1`). In temporal mode, tiles are anchored at `2×` their input position and each non-first tile's head latents are dropped (`head_trim`) — tile heads are malformed video-start latents; the previous tile owns that region and the crossfade spans the remaining `2·overlap−1−head_trim` latents. See SPEC_TILED_TEMPORAL. Temporal output is 50 fps material — single-shot refinement only (the AV Looping Sampler's audio math is 25 fps).
+**Supports both spatial and temporal upscalers — auto-detected** from the first tile's output shape (`L → L` spatial; `L → 2L−1` temporal, per the first-frame asymmetry: the LTX temporal upsampler doubles the pixel timeline, so `T` latents become `2T−1`). In temporal mode, tiles are anchored at `2×` their input position and each non-first tile's head latents are dropped (`head_trim`) — tile heads are malformed video-start latents; the previous tile owns that region and the crossfade spans the remaining `2·overlap−1−head_trim` latents. See SPEC_TILED_TEMPORAL. Temporal output is 50 fps material. It **can** be fed back through the AV Looping Sampler — the audio math is fps-aware since the `audio_pos` refactor (`SPEC_50FPS`), and `audio_pos(T, 25) == audio_pos(2T-1, 50)` exactly, so a correct 25 fps latent stays correct read as 50. Set `video_fps` to 50 on the sampler AND `frame_rate` to 50 on that pass's `LTXVConditioning` — a refinement pass missing the conditioning node runs the model at 25 and loses lipsync.
 
 | Input | Default | Description |
 |---|---|---|
