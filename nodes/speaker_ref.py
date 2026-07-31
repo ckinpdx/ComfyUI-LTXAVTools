@@ -1,32 +1,36 @@
 """
 ==============================================================================
-ABANDONED (2026-07-15): multi-reference / multi-speaker ID-LoRA is NOT thought
-to be possible with this architecture. The code below is kept as a record and
-a starting point, not removed — but do not expect it to produce clean
-multi-voice output.
+Multi-speaker [SPEAKER n] routing. WORKING as of 2026-07-30.
 
-WHY IT CANNOT WORK — the ID-LoRA is inherently SINGLE-VOICE:
-  * Its ref_audio tokens are attended GLOBALLY by every audio frame (voice
-    identity emerges from whole-clip self-attention), and the identity-guidance
-    pass amplifies that reference GLOBALLY. There is no mechanism to say "this
-    voice for these frames, that voice for those."
-  * It was TRAINED to transfer ONE voice to the ENTIRE clip. Any voice
-    diversity in a scene is out of distribution for it.
+SUPERSEDES the 2026-07-15 "ABANDONED - multi-voice is architecturally
+impossible" header that stood here. That conclusion was a FALSE NEGATIVE, and
+the reason is worth keeping:
 
-Per-chunk reference switching (this module's whole approach) therefore cannot
-fix it: at every turn boundary the incoming speaker's global reference fights
-the frozen audio carry belonging to the previous speaker, because the
-conditioning is not temporally localizable. Empirically, multi-speaker runs
-degrade (garbled onsets, wrong-speaker bleed), and the per-chunk-ref plus
-turn-silence workarounds never fully held — they patch a mechanism that
-fundamentally can't localize a single global voice.
+  ref_audio_bank never reached the sampler. `_prepare_guider` did
+  `copy.copy(guider)` - a SHALLOW copy - so `new_g.original_conds` was the same
+  dict object as the guider's, and `set_conds` assigns into it. Chunk 0
+  overwrote the base conditioning, and every later chunk read chunk 0's own
+  conds back as "base". The bank died with the first chunk, so EVERY chunk
+  silently used speaker 1.
 
-Real multi-voice requires a DIFFERENT mechanism, not a knob on this one:
-trained per-speaker binding (MultiTalk-style L-RoPE labels, or a
-Bind-Your-Avatar-style embedding router), or a model-level audio-attention mask
-restricting which frames attend to which ref tokens. None of that is reachable
-by driving the single-speaker ID-LoRA from the sampler. See
-memory/ltxav-looping-sampler.md for the full reasoning.
+  The "empirical" evidence for abandonment - garbled onsets, wrong-speaker
+  bleed - was therefore never a test of multi-voice at all. It was one voice
+  with per-chunk prompts telling it to be two.
+
+Fixed in 1.6.1. Verified: chunks log `ref=bank`, and the voice does switch.
+
+What the old header got RIGHT, and remains an open question rather than a
+settled one: ref_audio tokens are attended globally and the identity-guidance
+pass amplifies globally, so the ID-LoRA was trained to carry ONE voice across a
+clip. Per-chunk switching gives each chunk its own global reference, which is
+well-defined - but how cleanly two voices separate, and how the seam behaves at
+a turn boundary, is measured per run, not assumed in either direction.
+
+If the ceiling does turn out to be the ID-LoRA's rather than the routing's, the
+next move is trained per-speaker binding - one audio LoRA over N speakers with a
+distinct token per speaker in each caption (LTX's own guide names a LoRA as the
+tool for a specific voice; see memory/ltx-ic-lora.md). SPEC_NEG_REF_AUDIO.md
+remains a separate un-built alternative.
 ==============================================================================
 
 Multi-speaker voice identity for LTX2.3 AV ID-LoRA generation.
