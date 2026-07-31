@@ -75,10 +75,20 @@ class LTXVideoCutMarker:
                 "emit_fps": ("FLOAT", {
                     "default": 25.0, "min": 1.0, "max": 120.0, "step": 0.01,
                     "tooltip": "Frame space the schedule is emitted in — match the "
-                               "rate the video is CONSUMED at downstream (25 for the "
-                               "LTX AV pipeline / VHS force_rate 25), not the file's "
-                               "native fps. The widget shows the file's detected fps "
-                               "for reference only.",
+                               "rate the video is CONSUMED at downstream, NOT the "
+                               "file's native fps. The widget shows the file's "
+                               "detected fps for reference only. "
+                               "MUST equal the sampler's video_fps: scene_lengths are "
+                               "PIXEL FRAMES, so emitting at 25 for a 50 fps pipeline "
+                               "silently halves every scene's duration (and vice "
+                               "versa). It does not error — the schedule is simply "
+                               "wrong by 2x. 25 for a 25 fps pipeline, 50 for 50. "
+                               "If you DRIVE this from a link, the timeline panel "
+                               "resolves the source when it is a literal (Primitive / "
+                               "*Constant, through Reroutes). A computed source cannot "
+                               "be read from the frontend — the panel says so in its "
+                               "readout and previews at the last known rate rather "
+                               "than guessing.",
                 }),
                 "start_frame": ("INT", {
                     "default": 0, "min": 0, "max": 1_000_000,
@@ -90,19 +100,23 @@ class LTXVideoCutMarker:
             },
         }
 
-    RETURN_TYPES = ("STRING", "INT", "STRING", "INT", "INT")
+    RETURN_TYPES = ("STRING", "INT", "STRING", "INT", "INT", "FLOAT", "FLOAT")
+    # APPEND-ONLY: the two seconds outputs are last. ComfyUI links outputs by
+    # INDEX, so inserting them would re-point every existing link.
     RETURN_NAMES = ("scene_lengths", "frame_count", "video_path",
-                    "frame_load_cap", "skip_first_frames")
+                    "frame_load_cap", "skip_first_frames",
+                    "start_seconds", "duration_seconds")
     FUNCTION     = "mark"
     CATEGORY     = "LTXAVTools/utils"
     DESCRIPTION  = (
         "Interactive timeline for marking scene boundaries (plus optional start "
-        "and end markers) on a video, snapped to the LTX latent grid. Emits the "
-        "pipe-separated scene_lengths schedule for the AV Looping Sampler, the "
-        "matching total frame_count (sum - 7), the video's path (for VHS Load "
-        "Video (Path)), frame_load_cap (== frame_count) for the loader, and "
-        "skip_first_frames from the start marker so exactly the scheduled region "
-        "is loaded and generated."
+        "and end markers) on a video OR audio file, snapped to the LTX latent "
+        "grid. Emits the pipe-separated scene_lengths schedule for the AV Looping "
+        "Sampler, the matching total frame_count (sum - 7), the media path, "
+        "frame_load_cap (== frame_count) and skip_first_frames for a VHS video "
+        "loader, and start_seconds / duration_seconds for an AUDIO loader — the "
+        "same window expressed in seconds, so the loaded audio covers exactly the "
+        "scheduled region."
     )
 
     @classmethod
@@ -131,9 +145,22 @@ class LTXVideoCutMarker:
         frame_count = (sum(lengths) - 7) if lengths else 0
         skip = max(0, int(round(start_frame)))
 
+        # The same window in SECONDS, for an audio loader (VHS Load Audio (Path)
+        # seek_seconds / duration). frame_count is pixel frames in emit_fps space,
+        # so this is exactly the scheduled region — which is what keeps the loaded
+        # audio the right LENGTH. Short audio does not error: chunk 0 truncates and
+        # extend chunks zero-pad, and at high audio_cond_strength those zeros are
+        # frozen (a zero audio latent is OOD and decodes to a hum, not silence).
+        fps = float(emit_fps) if emit_fps and emit_fps > 0 else 25.0
+        start_seconds = skip / fps
+        duration_seconds = frame_count / fps
+
         print(f"[LTXVideoCutMarker] scene_lengths: '{out}' | frame_count/load_cap: "
-              f"{frame_count} | skip_first_frames: {skip} | video: {video_path}")
-        return (out, frame_count, video_path, frame_count, skip)
+              f"{frame_count} | skip_first_frames: {skip} | "
+              f"seconds: start {start_seconds:.3f} duration {duration_seconds:.3f} "
+              f"@ {fps:g}fps | media: {video_path}")
+        return (out, frame_count, video_path, frame_count, skip,
+                start_seconds, duration_seconds)
 
 
 NODE_CLASS_MAPPINGS = {
