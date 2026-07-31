@@ -32,8 +32,13 @@ from comfy_extras.nodes_lt import (
 # audio_pos is the global audio boundary map and the single source of truth for
 # every audio length in this file (SPEC_50FPS, implemented 2026-07-27). The
 # chunk-local helpers below are deprecated shims kept only for external callers.
-from .utils import AUDIO_LATENTS_PER_SECOND, audio_pos, ltx_mask_to_latent  # noqa: F401
+from .utils import (  # noqa: F401
+    AUDIO_LATENTS_PER_SECOND, audio_pos, ltx_mask_to_latent,
+    ltx_video_mask_to_audio_profile,
+)
 from .ic_reference import IC_PACK_KEY, apply_ic_references, get_ic_pack
+from .ic_reference_multi import IC_BANK_KEY
+from .ic_reference import select_ic_pack
 
 
 # ---------------------------------------------------------------------------
@@ -187,39 +192,56 @@ class LTXVAVLoopingSampler:
                 "latents":    ("LATENT",),
                 "temporal_tile_size": ("INT", {
                     "default": 80, "min": 24, "max": 1000, "step": 8,
-                    "tooltip": "Pixel frames per temporal tile (excluding overlap).",
+                    "tooltip": "Pixel frames of new content per chunk. PIXEL FRAMES, not seconds — the wall-clock length halves if you double video_fps.",
                 }),
                 "temporal_overlap": ("INT", {
                     "default": 24, "min": 16, "max": 80, "step": 8,
-                    "tooltip": "Pixel frames of overlap between temporal tiles.",
+                    "tooltip": "Pixel frames carried from the previous chunk. PIXEL FRAMES, not seconds — halves in wall-clock if you double video_fps.",
                 }),
                 "guiding_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Strength for optional_guiding_latents. Sets the guide "
+                               "tokens' noise mask (1-strength) and their attention "
+                               "entry. Below 1.0 engages an attention mask, which some "
+                               "backends handle by falling back to SDPA.",
                 }),
                 "temporal_overlap_cond_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Noise mask strength for video overlap carry-over region. "
-                               "Keep at 1.0 for AV generation — the frozen symmetric "
-                               "context (video and audio both 1.0) is what holds lipsync "
-                               "across chunks. Lower values let the model rewrite the "
-                               "seam and the modalities can decouple.",
+                    "tooltip": "Noise mask strength for the video overlap carry "
+                               "(1-strength). Keep at 1.0 for AV, matching the audio "
+                               "overlap strength.",
                 }),
                 "audio_overlap_cond_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Noise mask strength for audio overlap carry-over. "
-                               "Keep at 1.0, matching the video overlap strength — "
-                               "asymmetric anchors are the main cause of per-chunk "
-                               "lipsync dropout.",
+                    "tooltip": "Noise mask strength for the audio overlap carry "
+                               "(1-strength). Keep at 1.0, matching the video overlap "
+                               "strength.",
                 }),
                 "cond_image_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Strength for optional_cond_images. Index 0 is written "
+                               "in-place into latent frame 0; other indices are "
+                               "appended as guides with an attention entry.",
                 }),
-                "horizontal_tiles": ("INT", {"default": 1, "min": 1, "max": 6}),
-                "vertical_tiles":   ("INT", {"default": 1, "min": 1, "max": 6}),
-                "spatial_overlap":  ("INT", {"default": 1, "min": 1, "max": 8}),
+                "horizontal_tiles": ("INT", {
+                    "default": 1, "min": 1, "max": 6,
+                    "tooltip": "Spatial tiles across. Above 1, IC references are "
+                               "skipped (a full-frame reference has no tile crop).",
+                }),
+                "vertical_tiles": ("INT", {
+                    "default": 1, "min": 1, "max": 6,
+                    "tooltip": "Spatial tiles down. Above 1, IC references are skipped.",
+                }),
+                "spatial_overlap": ("INT", {
+                    "default": 1, "min": 1, "max": 8,
+                    "tooltip": "Latent cells of overlap between spatial tiles.",
+                }),
                 "video_fps": ("FLOAT", {
                     "default": 25.0, "min": 1.0, "max": 120.0, "step": 0.01,
-                    "tooltip": "Must match the fps of the AV latent. Used for audio frame alignment.",
+                    "tooltip": "Drives the AUDIO arithmetic only (chunk lengths, carry, "
+                               "stitch, via audio_pos). It does NOT tell the model the "
+                               "frame rate — that comes from LTXVConditioning's "
+                               "frame_rate, which defaults to 25 if absent. Set both.",
                 }),
             },
             "optional": {
@@ -228,24 +250,40 @@ class LTXVAVLoopingSampler:
                 "optional_negative_index_latents": ("LATENT",),
                 "optional_negative_index_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Conditioning strength for the negative-index reference "
-                               "latents. Lower values reduce pose/lighting bleed from "
-                               "the reference into the generation.",
+                    "tooltip": "Strength for optional_negative_index_latents. Sets "
+                               "their noise mask (1-strength) and attention entry; "
+                               "below 1.0 engages an attention mask.",
                 }),
                 "optional_positive_conditionings": ("CONDITIONING",),
                 "optional_normalizing_latents":    ("LATENT",),
                 "adain_factor": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Blends each chunk's output toward the AdaIN reference's "
+                               "per-channel statistics. 0 disables.",
                 }),
-                "guiding_start_step": ("INT", {"default": 0,    "min": 0, "max": 1000}),
-                "guiding_end_step":   ("INT", {"default": 1000, "min": 0, "max": 1000}),
-                "optional_cond_image_indices": ("STRING", {"default": "0"}),
+                "guiding_start_step": ("INT", {
+                    "default": 0, "min": 0, "max": 1000,
+                    "tooltip": "First schedule step where optional_guiding_latents "
+                               "are applied.",
+                }),
+                "guiding_end_step": ("INT", {
+                    "default": 1000, "min": 0, "max": 1000,
+                    "tooltip": "Last schedule step where optional_guiding_latents "
+                               "are applied.",
+                }),
+                "optional_cond_image_indices": ("STRING", {
+                    "default": "0",
+                    "tooltip": "Comma-separated pixel-frame indices, one per image in "
+                               "optional_cond_images. Negative values count from the "
+                               "end. Pair with LTX Keyframe Planner.",
+                }),
                 "audio_cond_strength": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Strength of conditioning on the input audio latent. "
-                               "0.0 = ignore input audio (generate freely). "
-                               "1.0 = fully condition on input audio (no regeneration). "
-                               "Only active when the input AV latent contains non-zero audio.",
+                    "tooltip": "Audio denoise mask = 1 - strength. The audio init is "
+                               "seeded from the input latent whenever input audio "
+                               "exists, independent of this. The audio profile from "
+                               "optional_denoise_mask (or optional_audio_denoise_mask) "
+                               "multiplies it.",
                 }),
                 "scene_lengths": ("STRING", {
                     "default": "",
@@ -345,6 +383,11 @@ class LTXVAVLoopingSampler:
                                "aligned, crisp); mean_threshold = middle; min = "
                                "intersection. Match this to LTX Inpaint Latent's "
                                "temporal_mode. Try 'last' for gray blobs at view changes.",
+                }),
+                "optional_audio_denoise_mask": ("MASK", {
+                    "tooltip": "Overrides the audio profile that is otherwise derived "
+                               "from optional_denoise_mask. Connect to mask audio and "
+                               "video independently; unconnected, audio follows video.",
                 }),
             },
         }
@@ -601,6 +644,14 @@ class LTXVAVLoopingSampler:
         if optional_positive_conditionings is None:
             return guider
         new_g = copy.copy(guider)
+        # copy.copy is SHALLOW: new_g.original_conds is the SAME dict object as
+        # guider.original_conds, and CFGGuider.set_conds assigns into it. Without
+        # this, chunk 0's set_conds below overwrites the BASE conditioning, and
+        # every later chunk reads chunk 0's own conds back as "base" — losing any
+        # upstream key not explicitly carried per-chunk (ref_audio_bank was the
+        # one that showed; ref_audio/frame_rate/ic_reference_pack only appeared to
+        # survive because they ARE carried, so chunk 0 handed them back).
+        new_g.original_conds = dict(guider.original_conds)
         positive, negative = _get_raw_conds(guider)
         idx = min(chunk_index, len(optional_positive_conditionings) - 1)
         chunk_pos = _strip_guide_keys(
@@ -628,10 +679,23 @@ class LTXVAVLoopingSampler:
         if ref_audio is None:
             ref_audio = base_vals.get("ref_audio")
             ref_source = "base" if ref_audio is not None else "none"
+        # Why the bank was not used. "ref=base" alone cannot distinguish a
+        # wiring problem (bank never reached the guider) from a node problem
+        # (bank arrived empty), and guessing between them from the graph is
+        # slower than one honest line of output.
+        why = ""
+        if ref_source != "bank" and speaker_idx is not None:
+            if "ref_audio_bank" not in base_vals:
+                why = (" | NO ref_audio_bank key on the guider's conditioning — "
+                       "LTXAVReferenceAudioMulti's POSITIVE output is not what "
+                       f"feeds this sampler's guider. base_vals keys: "
+                       f"{sorted(k for k in base_vals if k != 'model_conds')}")
+            elif not bank:
+                why = " | ref_audio_bank present but EMPTY"
         print(
             f"[LTXVAVLoopingSampler] chunk {chunk_index}: "
             f"speaker={speaker_idx if speaker_idx is not None else 'untagged'} "
-            f"ref={ref_source}"
+            f"ref={ref_source}{why}"
         )
         if ref_audio is not None:
             # speaker_idx is routing metadata — cleared so it never reaches the model
@@ -663,7 +727,17 @@ class LTXVAVLoopingSampler:
         # per-chunk conditioning is a bare encode and would otherwise arrive
         # without it, silently dropping the references on every chunk after the
         # first. Still INERT here — the chunk builders inject it.
+        # LTXAVAddICReferencesMulti banks views per speaker; select this chunk's
+        # set the same way the audio bank picks a voice, and merge in the
+        # all-chunks views (slot 0). With no bank this is the single-node path
+        # unchanged.
         ic_pack = base_vals.get(IC_PACK_KEY)
+        ic_bank = base_vals.get(IC_BANK_KEY)
+        if ic_bank:
+            ic_pack, ic_desc = select_ic_pack(
+                ic_bank, speaker_idx, standalone=ic_pack, chunk_index=chunk_index)
+            print(f"[LTXVAVLoopingSampler] chunk {chunk_index}: ic_refs={ic_desc}"
+                  + (f" ({ic_pack['n_views']} views)" if ic_pack else ""))
         if ic_pack is not None and chunk_pos:
             chunk_pos = node_helpers.conditioning_set_values(
                 chunk_pos, {IC_PACK_KEY: ic_pack}
@@ -794,6 +868,7 @@ class LTXVAVLoopingSampler:
         phase2_sampler=None, phase2_guider=None, phase2_start_step=0,
         guiding_downscale_factor=1,
         spatial_mask=None,
+        audio_profile=None,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -868,12 +943,22 @@ class LTXVAVLoopingSampler:
         # SPEC_50FPS: chunk 0 spans global latents [0, T_v), so its audio length
         # is audio_pos(T_v) - audio_pos(0) = audio_pos(T_v).
         T_a = audio_pos(T_v, fps)
-        if audio_cond_strength > 0.0:
-            T_a = min(T_a, audio_full.shape[2])
-            audio_init = audio_full[:, :, :T_a, :].clone()
-        else:
-            audio_init = torch.zeros(B, C_a, T_a, F_s,
-                                     device=audio_full.device, dtype=audio_full.dtype)
+        # Seed from the input audio whenever there IS input audio, independent
+        # of audio_cond_strength — which is now purely a MASK control, matching
+        # video (video_init always holds the input; the mask decides what is
+        # regenerated). Coupling the seed to the strength made
+        # "input audio as init WITH a free span" inexpressible, which is exactly
+        # what a video denoise mask does by default.
+        #
+        # PAD, never clamp. T_a stays audio_pos(T_v, fps) unconditionally — the
+        # whole boundary-map scheme assumes it, and shortening it here desyncs
+        # every downstream length. Extend chunks already zero-pad a short input;
+        # clamping made chunk 0 the odd one out and produced a delta mismatch.
+        audio_init = torch.zeros(B, C_a, T_a, F_s,
+                                 device=audio_full.device, dtype=audio_full.dtype)
+        avail = min(T_a, audio_full.shape[2])
+        if avail > 0 and float(audio_full.abs().max()) > 1e-6:
+            audio_init[:, :, :avail, :] = audio_full[:, :, :avail, :]
 
         self._debug_chunk(0, 0, T_v - 1, T_v, 0, T_a - 1, T_a, fps)
 
@@ -881,6 +966,15 @@ class LTXVAVLoopingSampler:
         audio_mask_val = 1.0 - audio_cond_strength
         audio_mask = torch.full((B, 1, T_a, F_s), audio_mask_val,
                                 device=audio_full.device, dtype=audio_full.dtype)
+        # Temporal audio mask: multiply, so the profile can only ever FREEZE
+        # (0 = keep). audio_cond_strength still governs how hard the input audio
+        # is held in the regions the profile leaves free.
+        if audio_profile is not None:
+            prof = audio_profile[:T_a].to(audio_mask.device, audio_mask.dtype)
+            if prof.shape[0] < T_a:
+                prof = torch.cat([prof, torch.ones(T_a - prof.shape[0],
+                                  device=prof.device, dtype=prof.dtype)])
+            audio_mask = audio_mask * prof.view(1, 1, -1, 1)
 
         # IC references: injected LAST, after every other guide/keyframe has been
         # placed, and before the AV combine — append_keyframe rejects a combined
@@ -955,6 +1049,7 @@ class LTXVAVLoopingSampler:
         ref_trailing_silence=None,
         guiding_downscale_factor=1,
         spatial_mask=None,
+        audio_profile=None,
     ):
         guider = copy.copy(guider)
         guider.original_conds = copy.deepcopy(guider.original_conds)
@@ -1143,7 +1238,8 @@ class LTXVAVLoopingSampler:
         a_global_new_start = audio_acc.shape[2]
         a_global_new_end   = a_global_new_start + T_a_new
         audio_new = torch.zeros(B, C_a, T_a_new, F_s, device=dev, dtype=dty)
-        if audio_cond_strength > 0.0 and a_global_new_start < audio_full.shape[2]:
+        # Seeded whenever input audio exists (see chunk 0) — strength is mask-only.
+        if float(audio_full.abs().max()) > 1e-6 and a_global_new_start < audio_full.shape[2]:
             a_end_clamped = min(a_global_new_end, audio_full.shape[2])
             available = a_end_clamped - a_global_new_start
             audio_new[:, :, :available, :] = audio_full[
@@ -1156,6 +1252,16 @@ class LTXVAVLoopingSampler:
         audio_mask = torch.ones(B, 1, T_a_chunk, F_s, device=dev, dtype=dty)
         audio_mask[:, :, :a_overlap, :] = 1.0 - audio_overlap_cond_strength
         audio_mask[:, :, a_overlap:,  :] = 1.0 - audio_cond_strength
+        # Temporal audio mask, sliced on the chunk's GLOBAL audio span (carry
+        # included). Multiplied in, so it can only freeze — the overlap carry
+        # keeps its own strength wherever the profile leaves it free.
+        if audio_profile is not None:
+            a0 = max(0, audio_acc.shape[2] - a_overlap)
+            prof = audio_profile[a0:a0 + T_a_chunk].to(dev, dty)
+            if prof.shape[0] < T_a_chunk:
+                prof = torch.cat([prof, torch.ones(T_a_chunk - prof.shape[0],
+                                  device=dev, dtype=dty)])
+            audio_mask = audio_mask * prof.view(1, 1, -1, 1)
 
         a_start_global = audio_acc.shape[2] - a_overlap
         self._debug_chunk(
@@ -1274,6 +1380,7 @@ class LTXVAVLoopingSampler:
         guiding_downscale_factor=1,
         video_cond_strength=0.0,
         spatial_mask=None,
+        audio_profile=None,
     ):
         T_v  = video_tile_latent["samples"].shape[2]
         chunk_idx    = 0
@@ -1342,6 +1449,7 @@ class LTXVAVLoopingSampler:
                 audio_cond_strength=audio_cond_strength,
                 video_cond_strength=video_cond_strength,
                 spatial_mask=spatial_mask,
+                audio_profile=audio_profile,
                 adain_factor=adain_factor,
                 phase2_sampler=phase2_sampler,
                 phase2_guider=phase2_guider,
@@ -1448,6 +1556,7 @@ class LTXVAVLoopingSampler:
         video_cond_strength=0.0,
         optional_denoise_mask=None,
         denoise_mask_temporal_mode="max",
+        optional_audio_denoise_mask=None,
     ):
         # Accepts the FLOAT latent_downscale_factor output of LTX IC-LoRA
         # Loader Model Only (metadata-driven); integer factor internally.
@@ -1481,6 +1590,22 @@ class LTXVAVLoopingSampler:
                   f"(1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200). At {video_fps} "
                   f"expect up to ~20 ms of per-boundary quantization; it does not "
                   f"accumulate, but seams may drift against a conditioned track.")
+
+        # A short input audio track is silent at render time: chunks pad it with
+        # zeros, and a zero audio latent is OOD — it decodes to a hum, not
+        # silence. At high audio_cond_strength those zeros are FROZEN, so the
+        # hum is baked in. Say so before the render rather than after.
+        _a_have = audio_samples.shape[2]
+        _a_want = audio_pos(video_samples.shape[2], video_fps)
+        if 0 < _a_have < _a_want and float(audio_samples.abs().max()) > 1e-6:
+            _short = (_a_want - _a_have) / AUDIO_LATENTS_PER_SECOND
+            print(f"[LTXVAVLoopingSampler] WARNING: input audio is {_a_have} latents "
+                  f"but this timeline needs {_a_want} ({_short:.2f}s short). The tail "
+                  f"is zero-padded, and a zero audio latent decodes to a hum rather "
+                  f"than silence — at audio_cond_strength {audio_cond_strength:g} "
+                  f"those frames are "
+                  f"{'FROZEN, so the hum lands in the output' if audio_cond_strength > 0.5 else 'regenerated'}. "
+                  f"Trim the video or extend the audio to match.")
 
         # video_fps drives audio arithmetic; the model reads frame_rate off the
         # conditioning. Disagreement is silent at render time — check up front.
@@ -1661,10 +1786,31 @@ class LTXVAVLoopingSampler:
         # Spatial keep-mask: prepared once on the full latent grid (covers the
         # whole working timeline, prior included), tile-sliced below.
         spatial_mask_full = None
+        audio_profile_full = None
         if optional_denoise_mask is not None:
             spatial_mask_full = self._prepare_spatial_mask(
                 optional_denoise_mask, frames, height, width,
                 mode=denoise_mask_temporal_mode)
+            # Audio profile is DERIVED from the video mask, never authored
+            # separately, so the two modalities cannot disagree about where a
+            # frozen span is (SPEC: video latent t owns audio [audio_pos(t),
+            # audio_pos(t+1))). This is what makes temporal AV inpainting —
+            # freeze A and B, regenerate the bridge between them — expressible.
+            audio_profile_full = ltx_video_mask_to_audio_profile(
+                spatial_mask_full, video_fps)
+
+        # An explicit audio mask REPLACES the derived profile. Deriving is the safe
+        # default (the modalities cannot disagree about a frozen span); this is the
+        # escape hatch for the case where they genuinely should — re-dubbing a span
+        # while the video stays untouched.
+        if optional_audio_denoise_mask is not None:
+            am = self._prepare_spatial_mask(
+                optional_audio_denoise_mask, frames, height, width,
+                mode=denoise_mask_temporal_mode)
+            audio_profile_full = ltx_video_mask_to_audio_profile(am, video_fps)
+            free = float((audio_profile_full > 0.5).float().mean()) * 100
+            print(f"[LTXVAVLoopingSampler] explicit audio mask: {free:.1f}% of the "
+                  f"audio free (overrides the video-derived profile).")
             kept = float((spatial_mask_full < 0.5).float().mean())
             print(f"[LTXVAVLoopingSampler] denoise mask active: "
                   f"{kept * 100:.1f}% of the latent grid kept (pinned to input).")
@@ -1773,6 +1919,7 @@ class LTXVAVLoopingSampler:
                     guiding_downscale_factor=guiding_downscale_factor,
                     video_cond_strength=video_cond_strength,
                     spatial_mask=tile_spatial_mask,
+                    audio_profile=audio_profile_full,
                 )
 
                 # accumulate video with spatial weights
