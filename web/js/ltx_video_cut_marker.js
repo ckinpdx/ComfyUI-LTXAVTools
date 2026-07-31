@@ -72,7 +72,101 @@ app.registerExtension({
             let loadedName = null;          // media the widget currently shows
             let pendingReset = false;       // user picked NEW media -> clear cuts on load
 
-            const fps = () => (fpsWidget?.value > 0 ? fpsWidget.value : 25.0);
+            // emit_fps may be a widget OR driven by a link. A linked widget's
+            // .value goes stale — the frontend never sees what the backend will
+            // resolve — so the timeline would silently preview at the wrong rate
+            // while the run used another. Walk one hop upstream and read a
+            // literal if there is one (Primitive / *Constant / through Reroutes).
+            // Computed sources can't be resolved in the frontend; those are
+            // reported honestly in the readout rather than guessed at.
+            const FPS_FALLBACK = 25.0;
+            let fpsCache = fpsWidget?.value > 0 ? fpsWidget.value : FPS_FALLBACK;
+            let fpsSource = "widget";
+
+            function fpsLinkOrigin() {
+                const g = node.graph || app.graph;
+                const inp = node.inputs?.find((i) => i.name === "emit_fps");
+                if (!g || !inp || inp.link == null) return null;
+                let link = g.links?.[inp.link];
+                for (let hop = 0; hop < 8 && link; hop++) {
+                    const src = g.getNodeById?.(link.origin_id);
+                    if (!src) return null;
+                    if (/reroute|passthrough/i.test(src.type || "") && src.inputs?.[0]) {
+                        link = g.links?.[src.inputs[0].link];
+                        continue;
+                    }
+                    return src;
+                }
+                return null;
+            }
+
+            // Only literal-valued sources are trusted. Reading "the first positive
+            // number" off an arbitrary node would happily return a step count or a
+            // seed and report it as the frame rate — a confident wrong answer is
+            // worse here than an honest "cannot read", which at least warns.
+            const FPS_LITERAL_SRC = /primitive|constant|^int$|^float$|number|value/i;
+
+            function readNumericWidget(src) {
+                if (!FPS_LITERAL_SRC.test(src.type || "")) return null;
+                const pools = [src.widgets_values, (src.widgets || []).map((w) => w?.value)];
+                for (const pool of pools) {
+                    if (!Array.isArray(pool)) continue;
+                    for (const v of pool) {
+                        const n = typeof v === "number" ? v : parseFloat(v);
+                        if (isFinite(n) && n > 0) return n;
+                    }
+                }
+                return null;
+            }
+
+            // Recomputes the effective rate and re-anchors the markers if it moved.
+            // Called from draw / readout / syncWidget so a linked rate is picked up
+            // without a widget callback ever firing.
+            function refreshFps() {
+                const src = fpsLinkOrigin();
+                let val, srcName;
+                if (src) {
+                    const up = readNumericWidget(src);
+                    val = up ?? fpsCache;
+                    srcName = up !== null ? "link" : "link-unresolved";
+                } else {
+                    val = fpsWidget?.value > 0 ? fpsWidget.value : FPS_FALLBACK;
+                    srcName = "widget";
+                }
+                fpsSource = srcName;
+                if (val !== fpsCache) {
+                    const old = fpsCache;
+                    fpsCache = val;
+                    reanchorMarkers(old, val);
+                    return true;
+                }
+                return false;
+            }
+
+            const fps = () => fpsCache;
+
+            // Start/end markers are LATENT indices, so unlike cuts (which store a
+            // wall-clock `.t`) they do NOT follow time when the rate changes: at
+            // 25 -> 50 the timeline doubles under them and both land at half their
+            // former moment, clamping the schedule to the first half of the video.
+            // Snapshot their times at the OLD rate, convert back at the new one.
+            function reanchorMarkers(oldFps, newFps) {
+                if (!(oldFps > 0) || !(newFps > 0) || oldFps === newFps) return;
+                const startT = startLat > 0
+                    ? (1 + 8 * (startLat - 1) + 0.5) / oldFps : null;
+                const endT = endLat !== null
+                    ? (8 * (endLat - 1) + 0.5) / oldFps : null;
+                if (startT !== null) {
+                    const f = timeToFrame(startT);
+                    startLat = Math.max(0, Math.min(totalLatents() - 1,
+                                                    Math.round((f - 1) / 8) + 1));
+                }
+                if (endT !== null) {
+                    const f = timeToFrame(endT);
+                    endLat = Math.max(startLat + 1,
+                             Math.min(totalLatents(), Math.round(f / 8) + 1));
+                }
+            }
             const duration = () => (isFinite(video.duration) ? video.duration : 0);
             const totalFrames = () => Math.max(1, Math.round(duration() * fps()));
             const lastFrame = () => totalFrames() - 1;
@@ -338,6 +432,7 @@ app.registerExtension({
                     .filter((L) => L > startLat && L <= effLatents() - 1);
             }
             function syncWidget() {
+                refreshFps();
                 if (!duration()) return;
                 scheduleMismatch = false;   // an explicit (re-)emit supersedes the warning
                 const Ls = boundaryLatents();
@@ -525,6 +620,7 @@ app.registerExtension({
                 return (x / canvas.width) * duration();
             }
             function draw() {
+                refreshFps();
                 const ctx = canvas.getContext("2d");
                 // Only reassign canvas.width on an actual size change — the
                 // assignment itself forces a full canvas reset.
@@ -768,6 +864,7 @@ app.registerExtension({
 
             // ---- readout ------------------------------------------------------
             function updateReadout() {
+                refreshFps();
                 const f = timeToFrame(video.currentTime);
                 const Ls = boundaryLatents();
                 let scene = 0;
@@ -778,6 +875,16 @@ app.registerExtension({
                     `t ${video.currentTime.toFixed(3)}s  |  frame ${f}  |  latent ${myLat}` +
                     `  |  scene #${scene}`
                 );
+                if (fpsSource === "link") {
+                    lines.push(`emit_fps: ${fps()} (from link — widget value ignored)`);
+                } else if (fpsSource === "link-unresolved") {
+                    lines.push(
+                        `⚠ emit_fps is driven by a link this panel cannot read ` +
+                        `(computed upstream). Timeline is PREVIEWING at ${fps()}; the ` +
+                        `run will use whatever the link resolves to. scene_lengths ` +
+                        `are pixel frames — a rate mismatch scales every scene.`
+                    );
+                }
                 const fileInfo = video.videoWidth === 0
                     ? "audio file"
                     : (detectedFps ? `~${detectedFps.toFixed(2)}` : "play to detect");
@@ -817,12 +924,36 @@ app.registerExtension({
             if (fpsWidget) {
                 fpsWidget.callback = function (...args) {
                     const rr = prevFpsCb?.apply(this, args);
+                    refreshFps();          // picks up the new value + re-anchors
                     cuts.forEach((c) => { c.t = frameToTime(snapBoundary(timeToFrame(c.t))); });
                     syncWidget();
                     draw();
                     return rr;
                 };
             }
+
+            // Nothing in this panel runs while idle — draw/readout fire only on
+            // pointer, key and playback events. So with a LINKED emit_fps you could
+            // change the rate upstream, hit Run without touching the timeline, and
+            // serialize a schedule built at the old rate. Re-resolve at the moment
+            // the value is collected for the run. scene_lengths is widget 1 and
+            // start_frame is widget 3, so the re-sync's start_frame update is picked
+            // up later in the same serialization pass.
+            const prevSceneSerialize = scenesWidget.serializeValue;
+            scenesWidget.serializeValue = async function (...args) {
+                if (refreshFps()) {
+                    console.debug("[CutMarker] emit_fps resolved to", fps(),
+                                  "at queue time — re-syncing schedule");
+                    cuts.forEach((c) => {
+                        c.t = frameToTime(snapBoundary(timeToFrame(c.t)));
+                    });
+                    syncWidget();
+                    draw();
+                }
+                return prevSceneSerialize
+                    ? await prevSceneSerialize.apply(this, args)
+                    : this.value;
+            };
 
             video.addEventListener("loadedmetadata", () => {
                 if (pendingReset) {
