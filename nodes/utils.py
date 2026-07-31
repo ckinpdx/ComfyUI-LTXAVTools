@@ -44,6 +44,49 @@ def audio_pos(n_latents, fps):
     return int(px * AUDIO_LATENTS_PER_SECOND / fps + 0.5)
 
 
+# ORDER IS PREFERENCE. Short clips can fit more than one rate (23.976 vs 24,
+# 48 vs 50), and the first match wins — so the rates people actually work at
+# come first and the oddballs last. Without this a 24 fps clip resolves to
+# 23.976 and every downstream duration inherits the drift.
+FPS_CANDIDATES = (25, 24, 50, 30, 60, 48, 20, 40, 15, 12, 10, 8, 5, 4, 2, 1,
+                  100, 120, 200, 23.976)
+
+
+def infer_av_fps(T_v, T_a, candidates=FPS_CANDIDATES):
+    """Recover a clip's frame rate from its own video:audio latent ratio.
+
+    Audio runs at a fixed 25 latents/second regardless of video fps, so
+    `audio_pos(T_v, fps) == T_a` pins the rate — a clip can be asked what it is
+    instead of trusted. Returns every candidate that fits (normally one; short
+    clips can be ambiguous, hence a list).
+    """
+    if T_v < 2:
+        return []                       # a 1-latent clip carries no ratio
+    return [f for f in candidates if audio_pos(T_v, f) == T_a]
+
+
+def ltx_video_mask_to_audio_profile(mask_5d, fps):
+    """[1,1,T,h,w] video denoise mask -> [audio_pos(T, fps)] audio profile.
+
+    Derived rather than authored, so the two modalities cannot disagree about
+    where a frozen span is. Video latent t owns audio [audio_pos(t),
+    audio_pos(t+1)) — with audio_pos(0) taken as 0, latent 0 owns exactly one
+    audio frame and every later latent owns q = 200/fps. Spatial reduction is
+    MAX: if any part of a video frame is being regenerated, its audio is too
+    (freezing audio under a partially-regenerating frame would fight the video).
+    """
+    T = int(mask_5d.shape[2])
+    per_frame = mask_5d.amax(dim=(3, 4)).reshape(-1)          # [T]
+    total = audio_pos(T, fps)
+    prof = torch.ones(total, device=mask_5d.device, dtype=mask_5d.dtype)
+    for t in range(T):
+        s = 0 if t == 0 else audio_pos(t, fps)
+        e = min(total, audio_pos(t + 1, fps))
+        if e > s:
+            prof[s:e] = per_frame[t]
+    return prof
+
+
 def ltx_mask_to_latent(m, T, lat_h, lat_w, mode="max"):
     """Pixel MASK -> [1,1,T,lat_h,lat_w] on the LTX latent grid.
 
@@ -1139,11 +1182,13 @@ class LTXInpaintColorFill:
         imgs = images[:n]
         if m.shape[1:] != imgs.shape[1:3]:
             m = torch.nn.functional.interpolate(
-                m[:, None], size=imgs.shape[1:3], mode="nearest",
+                m[:, None], size=imgs.shape[1:3], mode="bilinear",
+                align_corners=False,
             )[:, 0]
             print(f"[LTXInpaintColorFill] mask resized to {imgs.shape[2]}x"
-                  f"{imgs.shape[1]} (nearest — composite at final resolution "
-                  f"to avoid this).")
+                  f"{imgs.shape[1]} — source-grid blocks would be "
+                  f"{imgs.shape[2] / m.shape[2]:.2f}px wide with nearest; "
+                  f"composite at final resolution to avoid resampling at all.")
 
         m4 = m.unsqueeze(-1)
         fill = torch.tensor(rgb, device=imgs.device, dtype=imgs.dtype) / 255.0
@@ -1601,7 +1646,10 @@ class LTXNoiseFill:
     )
 
     def fill(self, images, mask, vae, noise_mode="decoded",
-             grow=32, seed=0, noise_scale=1.0):
+             grow=32, seed=0, noise_scale=1.0, _label="LTXNoiseFill"):
+        # _label lets a wrapping node (LTXRemovalEncode) print under its OWN
+        # name — a console line from a node that is not on the canvas is
+        # actively confusing when you are trying to trace a mask problem.
         F = torch.nn.functional
         dev = model_management.get_torch_device()
         imgs = images.to(dev)                                # [N,H,W,3]
@@ -1617,7 +1665,18 @@ class LTXNoiseFill:
         if m.shape[0] == 1 and N > 1:
             m = m.expand(N, -1, -1)
         if m.shape[1] != H or m.shape[2] != W:
-            m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
+            # Report it: a mask arriving at a different resolution than the video
+            # is resampled here, and that is invisible in the graph. Nearest would
+            # quantise the boundary to the SOURCE mask's grid — a 512-wide mask on
+            # 1728-wide video gives 3.4 px blocks — so resample smoothly and
+            # re-harden below. Coverage is unchanged; the edge follows the shape.
+            print(f"[{_label}] mask is {m.shape[2]}x{m.shape[1]} but the video "
+                  f"is {W}x{H} — resampling. Source-grid blocks would be "
+                  f"{W / m.shape[2]:.2f}px wide.")
+            m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="bilinear",
+                              align_corners=False).squeeze(1)
+        else:
+            print(f"[{_label}] mask matches the video at {W}x{H} — no resample.")
         if grow > 0:
             k = grow * 2 + 1
             mm = m.unsqueeze(1)
@@ -1848,7 +1907,8 @@ class LTXRemovalEncode:
         # tight pixel noise-fill (grow stays on the denoise side)
         filled, m = LTXNoiseFill().fill(
             images, mask, vae, noise_mode="decoded", grow=0,
-            seed=self._SEED, noise_scale=self._NOISE_SCALE)
+            seed=self._SEED, noise_scale=self._NOISE_SCALE,
+            _label="LTXRemovalEncode")
         # encode the person-free composite
         lat = vae.encode(filled)
         if isinstance(lat, dict):
@@ -1861,6 +1921,110 @@ class LTXRemovalEncode:
         print(f"[LTXRemovalEncode] tight noise-fill + encode + zero "
               f"(temporal={temporal_mode}); latent {lat.shape[4]}x{lat.shape[3]}x{T}.")
         return ({"samples": out}, m)
+
+
+class LTXAVTimeRangeMask:
+    """Build a denoise mask from TIME RANGES — white = regenerate, black = keep.
+
+    Hand-building these is the annoying part of any inpaint-in-time job: you need
+    a frame batch of exactly the right length with the right frames white, and it
+    has to land somewhere sensible on the 8:1 latent grid. This does the
+    arithmetic and reports what the range actually snapped to.
+
+    Spatially uniform (64x64) — this selects WHEN, not WHERE. Combine with a
+    spatial mask if you need both. Nothing is lost by the small size: the
+    sampler max-pools onto the latent grid anyway.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "frames": ("INT", {
+                    "default": 125, "min": 1, "max": 100000,
+                    "tooltip": "Total PIXEL frames in the clip — the same number "
+                               "you gave the empty latent (Frame / Scene Length "
+                               "Calculator's frame_count)."}),
+                "fps": ("FLOAT", {
+                    "default": 25.0, "min": 1.0, "max": 200.0, "step": 0.01}),
+                "ranges": ("STRING", {
+                    "default": "2-4",
+                    "tooltip": "Seconds to REGENERATE, e.g. '2-4' or '2-4, 7-9.5'. "
+                               "Everything else is kept."}),
+            },
+            "optional": {
+                "feather_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 64,
+                    "tooltip": "Pixel frames of ramp at each edge. Note the latent "
+                               "reduction is per 8-frame group, so a feather much "
+                               "under 8 has little effect."}),
+                "invert": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Regenerate everything EXCEPT the ranges."}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "STRING")
+    RETURN_NAMES = ("mask", "info")
+    FUNCTION = "build"
+    CATEGORY = "LTXAVTools/utils"
+    DESCRIPTION = (
+        "Denoise mask from time ranges (white = regenerate). Reports the latent "
+        "and audio spans the range actually lands on, so you can see what the "
+        "8:1 grid did to it before spending a render."
+    )
+
+    def build(self, frames, fps, ranges, feather_frames=0, invert=False):
+        label = "LTXAVTimeRangeMask"
+        prof = torch.zeros(int(frames), dtype=torch.float32)
+        spans = []
+        for tok in ranges.replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                a, b = (float(x) for x in tok.split("-"))
+            except ValueError:
+                print(f"[{label}] ignoring unparseable range {tok!r} "
+                      f"(expects 'start-end' in seconds)")
+                continue
+            i0 = max(0, int(round(a * fps)))
+            i1 = min(int(frames), int(round(b * fps)))
+            if i1 <= i0:
+                print(f"[{label}] range {tok!r} is empty after conversion "
+                      f"(frames {i0}..{i1}) — skipped.")
+                continue
+            prof[i0:i1] = 1.0
+            if feather_frames > 0:
+                f = min(feather_frames, (i1 - i0) // 2)
+                if f > 0:
+                    ramp = torch.linspace(0, 1, f + 2)[1:-1]
+                    if i0 > 0:
+                        prof[i0:i0 + f] = ramp
+                    if i1 < frames:
+                        prof[i1 - f:i1] = ramp.flip(0)
+            spans.append((tok, i0, i1))
+
+        if invert:
+            prof = 1.0 - prof
+
+        # What the 8:1 grid will actually do with it (mode=max: any touched
+        # latent frame goes free), and the audio span that follows via audio_pos.
+        T_lat = (int(frames) - 1) // 8 + 1
+        lines = []
+        for tok, i0, i1 in spans:
+            l0 = 0 if i0 == 0 else (i0 - 1) // 8 + 1
+            l1 = min(T_lat, (i1 - 1) // 8 + 1)
+            lines.append(
+                f"  {tok}s -> px [{i0},{i1}) -> latent [{l0},{l1}) -> audio "
+                f"[{audio_pos(max(l0,1), fps) if l0 else 0},{audio_pos(l1, fps)})")
+        free = float((prof > 0.5).float().mean()) * 100
+        info = chr(10).join(
+            [f"{int(frames)} px frames @ {fps:g}fps ({frames / fps:.2f}s), "
+             f"{T_lat} latents | {free:.1f}% free"
+             + (" (inverted)" if invert else "")] + lines)
+        print(f"[{label}] {info}")
+        return (prof.view(-1, 1, 1).expand(-1, 64, 64).contiguous(), info)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1879,6 +2043,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXInpaintLatent":                 LTXInpaintLatent,
     "LTXNoiseFill":                     LTXNoiseFill,
     "LTXRemovalEncode":                 LTXRemovalEncode,
+    "LTXAVTimeRangeMask":               LTXAVTimeRangeMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1897,4 +2062,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXInpaintLatent":                 "LTX Inpaint Latent",
     "LTXNoiseFill":                     "LTX Noise Fill (pixel removal)",
     "LTXRemovalEncode":                 "LTX Removal Encode",
+    "LTXAVTimeRangeMask":               "LTX AV Time Range Mask",
 }
