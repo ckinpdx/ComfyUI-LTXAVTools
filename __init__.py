@@ -12,9 +12,11 @@ from .nodes.cross_attn_toggle import NODE_CLASS_MAPPINGS as _CATCM, NODE_DISPLAY
 from .nodes.ref_audio_bank import NODE_CLASS_MAPPINGS as _RABCM, NODE_DISPLAY_NAME_MAPPINGS as _RABDM
 from .nodes.video_cut_marker import NODE_CLASS_MAPPINGS as _VCMCM, NODE_DISPLAY_NAME_MAPPINGS as _VCMDM
 from .nodes.ic_reference import NODE_CLASS_MAPPINGS as _ICRCM, NODE_DISPLAY_NAME_MAPPINGS as _ICRDM
+from .nodes.ic_reference_multi import NODE_CLASS_MAPPINGS as _ICMCM, NODE_DISPLAY_NAME_MAPPINGS as _ICMDM
+from .nodes.clip_join import NODE_CLASS_MAPPINGS as _CJCM, NODE_DISPLAY_NAME_MAPPINGS as _CJDM
 
-NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM, **_CDPCM, **_SRCM, **_CATCM, **_RABCM, **_VCMCM, **_ICRCM}
-NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM, **_CDPDM, **_SRDM, **_CATDM, **_VCMDM, **_RABDM, **_ICRDM}
+NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM, **_CDPCM, **_SRCM, **_CATCM, **_RABCM, **_VCMCM, **_ICRCM, **_ICMCM, **_CJCM}
+NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM, **_CDPDM, **_SRDM, **_CATDM, **_VCMDM, **_RABDM, **_ICRDM, **_ICMDM, **_CJDM}
 
 WEB_DIRECTORY = "./web/js"
 
