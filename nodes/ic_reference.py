@@ -82,6 +82,139 @@ def build_reference_stack(images, layout):
     return torch.cat(frames, dim=0), n
 
 
+def encode_reference_pack(vae, reference_images, width, height, strength,
+                          latent_downscale_factor, layout, crop,
+                          label="LTXAVAddICReferences", slot=""):
+    """Encode reference views into an inert pack.
+
+    Shared by the single and Multi nodes so there is exactly one copy of the
+    grid math, the 8n+1 truncation assert, and the token accounting.
+    """
+    factor = max(1, int(round(float(latent_downscale_factor))))
+
+    ts = vae.downscale_index_formula          # (time, width, height) scales
+    _, w_scale, h_scale = ts
+    lat_w = width // w_scale
+    lat_h = height // h_scale
+
+    # Mirrors the official node's guard: dilation needs the full grid to
+    # partition evenly, and the failure downstream is an opaque shape error.
+    if factor > 1 and (lat_w % factor or lat_h % factor):
+        raise ValueError(
+            f"[{label}] generation latent grid {lat_w}x{lat_h} "
+            f"(from {width}x{height}) is not divisible by "
+            f"latent_downscale_factor {factor}. Pick generation dims whose "
+            f"latent grid divides evenly — e.g. a multiple of {32 * factor} px."
+        )
+
+    n_views = reference_images.shape[0]
+    stack, kept = build_reference_stack(reference_images, layout)
+    if layout == "single_frame" and n_views > 1:
+        print(f"[{label}] layout=single_frame — using the first of "
+              f"{n_views} images. Use one_latent_per_view to keep them all.")
+
+    target_w = int(lat_w * w_scale / factor)
+    target_h = int(lat_h * h_scale / factor)
+    pixels = comfy.utils.common_upscale(
+        stack.movedim(-1, 1), target_w, target_h, "bilinear", crop=crop
+    ).movedim(1, -1)[:, :, :, :3]
+
+    latents = vae.encode(pixels)
+
+    # The truncation this node exists to defuse — assert it did not happen.
+    if latents.shape[2] != kept:
+        raise RuntimeError(
+            f"[{label}] encoded {latents.shape[2]} latent frames "
+            f"from {kept} reference view(s) — expected {kept}. The temporal VAE "
+            f"truncates to 8n+1 pixel frames; the stack was {stack.shape[0]}."
+        )
+
+    pack = {
+        "latents": latents.cpu(),
+        "strength": float(strength),
+        "factor": factor,
+        "gen_latent_hw": (lat_h, lat_w),
+        "n_views": kept,
+    }
+
+    # Two counts, and confusing them is easy: at factor > 1 the guide is
+    # DILATED back onto the full grid, so append_keyframe reports
+    # frames*lat_h*lat_w keyframe tokens ("pre-filter"), of which only every
+    # factor-th position is real — the holes carry mask -1 and the model's
+    # grid_mask drops them. The real attention cost is the smaller number.
+    real = latents.shape[2] * (lat_h // factor) * (lat_w // factor)
+    pre = latents.shape[2] * lat_h * lat_w
+    print(f"[{label}] {slot}{kept} reference view(s) -> "
+          f"{latents.shape[2]} latent frames at {latents.shape[4]}x{latents.shape[3]} "
+          f"(factor {factor}), strength {strength}. ~{real} tokens per chunk"
+          + (f" ({pre} pre-filter, holes dropped by grid_mask)" if factor > 1 else "")
+          + ". Inert until the looping sampler injects it.")
+    return pack
+
+
+def merge_packs(packs, label="LTXAVAddICReferencesMulti"):
+    """Concatenate packs into one along the TIME axis, in the order given.
+
+    One guide append instead of several: cheaper, and it keeps the views in a
+    single deterministic slot order, which matters because MSR is positional.
+    Only packs sharing a grid and downscale factor can merge — they always do
+    when they come from one Multi node (shared widgets), so a mismatch means a
+    standalone node was mixed in with different settings.
+    """
+    packs = [p for p in packs if p is not None]
+    if not packs:
+        return None
+    if len(packs) == 1:
+        return packs[0]
+    head = packs[0]
+    for p in packs[1:]:
+        if p["gen_latent_hw"] != head["gen_latent_hw"] or p["factor"] != head["factor"]:
+            raise ValueError(
+                f"[{label}] cannot combine reference packs built for different "
+                f"geometry: {head['gen_latent_hw']}@factor{head['factor']} vs "
+                f"{p['gen_latent_hw']}@factor{p['factor']}. Give every IC "
+                f"reference node the same width/height/latent_downscale_factor."
+            )
+        if p["strength"] != head["strength"]:
+            print(f"[{label}] merging packs with different strengths "
+                  f"({head['strength']} and {p['strength']}); using "
+                  f"{head['strength']} for the combined guide.")
+    return {
+        "latents": torch.cat([p["latents"] for p in packs], dim=2),
+        "strength": head["strength"],
+        "factor": head["factor"],
+        "gen_latent_hw": head["gen_latent_hw"],
+        "n_views": sum(p["n_views"] for p in packs),
+    }
+
+
+def select_ic_pack(bank, speaker_idx, standalone=None, chunk_index=0):
+    """Resolve one chunk's references: this speaker's views, then the
+    all-chunks views, then any standalone pack — that order, so the
+    all-chunks plate keeps the TAIL slot it occupies in a hand-built batch.
+
+    Returns (pack, description) with description naming what was selected so
+    the sampler can log a mis-tagged chunk instead of silently under-referencing.
+    """
+    if not bank:
+        return standalone, "pack" if standalone is not None else "none"
+    shared = bank.get(0)
+    if speaker_idx is None:
+        # No tag means we do not know who is on screen — an establishing shot
+        # may hold everyone. Send every speaker's views rather than narrowing
+        # to the shared plate, which would leave the chunk with no identity.
+        chosen = merge_packs([bank[k] for k in sorted(bank) if k])
+        desc = "bank(all speakers)"
+    else:
+        chosen = bank.get(speaker_idx)
+        if chosen is None:
+            print(f"[LTXAVAddICReferencesMulti] chunk {chunk_index}: [SPEAKER "
+                  f"{speaker_idx}] has no reference images in the bank (have "
+                  f"{sorted(k for k in bank if k)}); using the all-chunks views only.")
+        desc = f"bank[{speaker_idx}]" if chosen is not None else "bank[shared]"
+    return merge_packs([chosen, shared, standalone]), desc
+
+
 class LTXAVAddICReferences:
     """Encode reference views and attach them as an inert pack (see module doc)."""
 
@@ -125,66 +258,10 @@ class LTXAVAddICReferences:
 
     def attach(self, positive, negative, vae, reference_images, width, height,
                strength, latent_downscale_factor, layout, crop):
-        factor = max(1, int(round(float(latent_downscale_factor))))
-
-        ts = vae.downscale_index_formula          # (time, width, height) scales
-        _, w_scale, h_scale = ts
-        lat_w = width // w_scale
-        lat_h = height // h_scale
-
-        # Mirrors the official node's guard: dilation needs the full grid to
-        # partition evenly, and the failure downstream is an opaque shape error.
-        if factor > 1 and (lat_w % factor or lat_h % factor):
-            raise ValueError(
-                f"[LTXAVAddICReferences] generation latent grid {lat_w}x{lat_h} "
-                f"(from {width}x{height}) is not divisible by "
-                f"latent_downscale_factor {factor}. Pick generation dims whose "
-                f"latent grid divides evenly — e.g. a multiple of {32 * factor} px."
-            )
-
-        n_views = reference_images.shape[0]
-        stack, kept = build_reference_stack(reference_images, layout)
-        if layout == "single_frame" and n_views > 1:
-            print(f"[LTXAVAddICReferences] layout=single_frame — using the first of "
-                  f"{n_views} images. Use one_latent_per_view to keep them all.")
-
-        target_w = int(lat_w * w_scale / factor)
-        target_h = int(lat_h * h_scale / factor)
-        pixels = comfy.utils.common_upscale(
-            stack.movedim(-1, 1), target_w, target_h, "bilinear", crop=crop
-        ).movedim(1, -1)[:, :, :, :3]
-
-        latents = vae.encode(pixels)
-
-        # The truncation this node exists to defuse — assert it did not happen.
-        if latents.shape[2] != kept:
-            raise RuntimeError(
-                f"[LTXAVAddICReferences] encoded {latents.shape[2]} latent frames "
-                f"from {kept} reference view(s) — expected {kept}. The temporal VAE "
-                f"truncates to 8n+1 pixel frames; the stack was {stack.shape[0]}."
-            )
-
-        pack = {
-            "latents": latents.cpu(),
-            "strength": float(strength),
-            "factor": factor,
-            "gen_latent_hw": (lat_h, lat_w),
-            "n_views": kept,
-        }
+        pack = encode_reference_pack(
+            vae, reference_images, width, height, strength,
+            latent_downscale_factor, layout, crop, label="LTXAVAddICReferences")
         positive = node_helpers.conditioning_set_values(positive, {IC_PACK_KEY: pack})
-
-        # Two counts, and confusing them is easy: at factor > 1 the guide is
-        # DILATED back onto the full grid, so append_keyframe reports
-        # frames*lat_h*lat_w keyframe tokens ("pre-filter"), of which only every
-        # factor-th position is real — the holes carry mask -1 and the model's
-        # grid_mask drops them. The real attention cost is the smaller number.
-        real = latents.shape[2] * (lat_h // factor) * (lat_w // factor)
-        pre = latents.shape[2] * lat_h * lat_w
-        print(f"[LTXAVAddICReferences] {kept} reference view(s) -> "
-              f"{latents.shape[2]} latent frames at {latents.shape[4]}x{latents.shape[3]} "
-              f"(factor {factor}), strength {strength}. ~{real} tokens per chunk"
-              + (f" ({pre} pre-filter, holes dropped by grid_mask)" if factor > 1 else "")
-              + ". Inert until the looping sampler injects it.")
         return (positive, negative)
 
 
