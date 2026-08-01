@@ -140,11 +140,13 @@ and the IC reference nodes' `strength`.
 sampling loop, never as attention masks. They are kernel-agnostic and guider-agnostic, so
 they behave the same under `MultimodalGuider` as under `CFGGuider`.
 
-**If you need a partial guide under `MultimodalGuider`:** window it in TIME rather than
-weakening it — keep the strength at 1.0 and use `guiding_start_step` / `guiding_end_step`.
-That expresses "partly guided" without ever creating a mask. The alternative is to sample
-with a plain `CFGGuider`, which handles sub-1.0 strengths correctly and costs you only the
-per-modality CFG split.
+**If you need a partial guide under `MultimodalGuider`:** there is no way to window a
+guide within one pass — see §7, guides are appended tokens, not a per-step influence.
+Run a **guided partial pass** (`sampling_end_step` at your cutoff) and finish it in a
+second pass (`sampling_start_step` at the same number) whose conditioning never had the
+guide added. The simpler alternative is to
+sample with a plain `CFGGuider`, which handles sub-1.0 strengths correctly and costs you
+only the per-modality CFG split.
 
 Related but distinct: the same combination can also *crash* rather than degrade — see the
 `expanded size of tensor` row in §13.
@@ -499,16 +501,58 @@ for the LoRA; the multi-speaker structure exists only in the scheduler. Rules:
 
 ## 7. Motion guidance (IC-LoRA)
 
-### `optional_guiding_latents`, `guiding_strength`, `guiding_start_step`, `guiding_end_step`
+### `optional_guiding_latents`, `guiding_strength`, `sampling_start_step`, `sampling_end_step`
+
+> **VIDEO latent, not AV.** `optional_guiding_latents`, `optional_negative_index_latents`
+> and `optional_normalizing_latents` all take a plain video latent. Feeding a combined AV
+> latent used to corrupt silently: `NestedTensor.shape` reports the VIDEO shape so frame
+> counts look correct, but slicing propagates to BOTH tensors on the same axis —
+> `[:, :, 0:5]` gives 5 video latents and 5 AUDIO latents where ~40 were meant. Rejected
+> with a message since 1.7.1. Split with `LTXVSeparateAVLatent` and wire `video_latent`.
+> (`optional_prior_av_latent` and the main `latents` input DO take AV.)
 
 A full-length control latent (pose tracks, depth, v2v source) sliced to each chunk's
 window automatically — the one input that spans the whole timeline besides input audio.
 Requires the matching IC-LoRA loaded; on the base model guide latents are weak.
 
-`guiding_start_step` / `guiding_end_step` window the guidance within the sigma schedule:
-guidance during early steps controls structure/motion; releasing it before the final
-steps lets textures diverge from the guide. The sampler splits the schedule and runs the
-segments back-to-back.
+**A guide cannot be windowed within a pass, and these two knobs never did it.** They were
+named `guiding_start_step` / `guiding_end_step` until 1.8.0, which implied a window over the
+guide's influence. What they really are:
+
+| widget | what it does |
+|---|---|
+| `sampling_start_step` | **Begins here, skipping earlier steps.** The incoming latent is re-noised to that sigma and finished from there. |
+| `sampling_end_step` | **Stops here.** Later steps are discarded, leaving a partially denoised latent. Set it to 4 and you get 4 steps. |
+
+Together they window the schedule, using core `SplitSigmas`' own slicing — first output
+`sigmas[:step+1]`, second output `sigmas[step:]`, sharing the boundary sigma. Both are
+**absolute indices** into the incoming schedule, so a two-pass handoff needs no arithmetic:
+
+```
+pass 1   sampling_start_step 0   sampling_end_step 4      guide wired
+pass 2   sampling_start_step 4   sampling_end_step 1000   guide unwired
+```
+
+4 + 8 = 12 steps, no overlap, no gap. Wiring `SplitSigmas` by hand gives byte-identical
+sigmas; the widgets just save you the nodes.
+
+**Why no windowing is possible.** `_add_latent_guide` does not set a per-step weight — it
+**appends latent frames** to the tensor and `keyframe_idxs` to the conditioning, then crops
+them off after the chunk. The console shows it:
+
+```
+guide appended: 18 latents ... | latent T now 50 | keyframe tokens now 4140
+crop: T_in=50 | trim=23 | T_out=27
+```
+
+Releasing the guide mid-schedule would mean changing the tensor's shape between steps.
+The phase-2 guider cannot do it either — it is deliberately given the chunk's FULL
+conditioning (guides, keyframes, `ref_audio`) so it does not sample against stale conds.
+
+**To actually get structure-early / freedom-late**, use two passes with the window above:
+a guided pass ending at your cutoff, then a second pass starting there with the guide
+unwired. Pass 2's `latents` input takes pass 1's `denoised_output` directly — that is the
+model's x0 estimate (soft, not noisy), and the sigma schedule re-noises it.
 
 ---
 
@@ -605,7 +649,7 @@ from noise** at target res with stage 1 as small-grid in-context reference
 directly; same `scene_lengths` and per-chunk prompts as stage 1 (seams align →
 each chunk references its own stage-1 content); upscaler LoRA loaded with
 factor wired from metadata; `guiding_strength 1.0` (loosen adherence via
-`guiding_end_step`, never sub-1.0 strength); full-gen sigma schedule, not a
+`sampling_end_step`, never sub-1.0 strength); full-gen sigma schedule, not a
 low-sigma tail. Stage 1 can drop to very low res (~quarter / ~280p — the
 3-stage dimension calculator's ÷128 constraint is exactly the x4 divisibility
 requirement): structure and AV sync commit there, detail is synthesized here.
@@ -680,8 +724,8 @@ Same base seed, `per_tile_seed_offsets` with a nonzero entry at the offending ch
 | Seam "speaks" the next chunk's prompt / re-voiced boundary | keep-carry-verbatim stitch (fixed 2026-07-15) — runs automatically at `audio_overlap_cond_strength ≥ 1.0`; the frozen carry is no longer regenerated under the next chunk's conditioning. Also kills static-image burn-in and continuation gibberish. |
 | Gibberish generated speech over a guide video (changing the words) | the guide's visible lips out-muscle the text via v2a — set `v2a_cross_attn = False` on the **LTX AV Cross-Attention Toggle** node. Text drives the audio; a2v resyncs the mouth. Only bites during generation; irrelevant with input audio. |
 | Lips move during silence over a guide video | the guide's original lip motion bleeds through where the new audio is silent — fill the runtime with dialog (no dead air), and/or free the mouth more (higher CrossView regeneration, lower guide/overlap strength) so a2v dominates it. |
-| Crash: `expanded size of tensor … must match` inside attention, with MultimodalGuider | STG perturbed pass × any sub-1.0 guide strength (incl. `cond_image_strength 0.5`) breaks core's guide-mask attention. Set `perturb_attn=false`/`stg=0` in GuiderParameters (keeps per-modality CFG), or keep all guide strengths at 1.0 and window via `guiding_start/end_step` |
-| Artifacts / degraded generations (no error) with MultimodalGuider | Any sub-1.0 GUIDE strength — it registers an attention entry the guider's extra passes mishandle. Keep guide strengths at 1.0 and window via `guiding_start/end_step`, or sample with `CFGGuider`. Sampling-loop levers (`audio_cond_strength`, denoise masks) are unaffected — see §2b |
+| Crash: `expanded size of tensor … must match` inside attention, with MultimodalGuider | STG perturbed pass × any sub-1.0 guide strength breaks core's guide-mask attention. Triggered by MULTIPLE `optional_cond_images`: index 0 is written in-place (no guide), so a single image never crashes at any strength; a second image is APPENDED as a guide and its sub-1.0 strength creates the mask. Fix: **`stg = 0` on BOTH GuiderParameters nodes** — the perturbed pass is gated by `any(params.do_perturbed() ...)` over audio AND video, so one non-zero stg keeps it alive. Per-modality CFG and modality_scale still work. `perturb_attn = false` does NOT skip the pass (it only changes `calc_stg_indexes`). Otherwise keep guide strengths at 1.0. |
+| Artifacts / degraded generations (no error) with MultimodalGuider | Any sub-1.0 GUIDE strength — it registers an attention entry the guider's extra passes mishandle. Keep guide strengths at 1.0 and split into two passes via `sampling_end_step` (guides cannot be windowed — §7), or sample with `CFGGuider`. Sampling-loop levers (`audio_cond_strength`, denoise masks) are unaffected — see §2b |
 | Crash: `guide pre_filter_counts != keyframe grid mask length` | stale guide conditioning — either an upstream guide node (LTXVAddGuide / IC-LoRA guide) or a cached cond polluted across queue runs. The sampler now **auto-strips** guide bookkeeping on entry (prints `stripping stale guide conditioning …`) and no longer memoizes onto the cached guider, so this should be fixed. If it still fires, note what the strip message names and report it; references go through `optional_guiding_latents` only |
 | Inpaint: masked region unchanged, or whole frame drifts | `optional_denoise_mask` — unchanged = polarity inverted (white must be the regen region; check the `N% kept` console line) or the mask isn't reaching the model; whole-frame drift = mask absent so nothing is pinned. Needs real video in the input latent (§5b) |
 | Inpaint fill looks pasted-on / large hole invents wrong structure | base model has too little surrounding context — switch to the IC-LoRA route (LTX Inpaint Color Fill + inpaint LoRA, §5b fallback) |

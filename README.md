@@ -551,8 +551,8 @@ empty AV latent (new duration; scene_lengths for the continuation) → latents
 - The output is the full `prior + continuation` as one AV latent. No masks are involved on input or output.
 - Works with `audio_cond_strength` for the new region (free-gen or condition on a new track); the prior's own audio carries forward via the audio bridge.
 - Not yet combined with mid-video keyframes or IC-LoRA guiding latents in the same pass (their indices assume a from-zero timeline).
-| `guiding_start_step` | 0 | Sigma schedule step at which guiding latents begin influencing. |
-| `guiding_end_step` | 1000 | Sigma schedule step at which guiding latents stop influencing. |
+| `sampling_start_step` | 0 | **Begin here**, skipping earlier steps; the incoming latent is re-noised to that sigma. Core `SplitSigmas`' second output (`sigmas[step:]`). Absolute index. Was `guiding_start_step`. |
+| `sampling_end_step` | 1000 | **Stop here**; later steps are discarded, leaving a partially denoised latent. Core `SplitSigmas`' first output (`sigmas[:step+1]`). Pairs with `sampling_start_step` to window the schedule in-node. Not a guide control. Was `guiding_end_step`. |
 
 ### Audio continuity
 

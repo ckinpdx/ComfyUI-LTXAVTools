@@ -1,5 +1,88 @@
 # Changelog
 
+## 1.9.1 - 2026-07-31
+
+### Fixed
+- **ComfyUI 0.29.0 compatibility: the latent upsamplers.** 0.29.0 converted the
+  latent upsampler model to `ModelPatcherDynamic` (PR #15063). Both
+  `LTXVAVLatentUpsampler` and `LTXVAVLatentUpsamplerTiled` called
+  `upscale_model.parameters()`, `.to(device)`, `.cpu()` and invoked it directly
+  — all `nn.Module` APIs a patcher does not have (it wraps the module in
+  `.model`), so both would have raised `AttributeError` on the first line.
+
+  `_unwrap_upscale_model()` now accepts either shape and returns
+  `(module, patcher_or_None)`. When a patcher is present, weights are moved with
+  `model_management.load_model_gpu()` rather than a manual `.to()`/`.cpu()` —
+  hand-moving a patched module fights ComfyUI's memory bookkeeping — and
+  unloading is left to ComfyUI. On <= 0.28 the behaviour is byte-identical to
+  before.
+
+## 1.9.0 - 2026-07-31
+
+### Added
+- **`sampling_start_step` — a start step that actually starts there.** Skips the
+  steps before it, re-noising the incoming latent to that sigma. With
+  `sampling_end_step` it windows the schedule in-node, using core `SplitSigmas`'
+  own slicing (first output `sigmas[:step+1]`, second `sigmas[step:]`, sharing
+  the boundary sigma). Verified byte-identical to a hand-wired SplitSigmas chain.
+
+  Both are ABSOLUTE indices into the incoming schedule, so a two-pass handoff
+  needs no arithmetic — pass 1 `end 4`, pass 2 `start 4`, and 4 + 8 = 12 steps
+  with no gap or overlap. This is the only way to release a guide between
+  passes: guides are appended tokens, so `phase2_start_step` (which inherits the
+  chunk's full conditioning) cannot do it.
+
+  An empty or inverted window (`start >= end`, or a start past the schedule's
+  end) is rejected with a message rather than sampling zero steps.
+
+### Changed
+- **BREAKING for stale non-zero values in widget slot 12.** That slot was
+  `guiding_start_step`, renamed to `sampler_restart_step` earlier today, and is
+  now `sampling_start_step`. Its behaviour changed with it: the old widget split
+  the schedule and restarted the sampler (no useful effect, and it discarded
+  multi-step sampler history); the new one SKIPS the steps before it. A saved
+  non-zero value will now shorten the run instead of doing nothing. The default
+  0 is unaffected, and nobody set it deliberately because it did nothing worth
+  setting — but it is a real behaviour change on an existing widget position.
+
+  Widget POSITION is unchanged (12 of 22), so saved workflows still deserialize
+  their other values correctly.
+
+## 1.8.0 - 2026-07-31
+
+### Changed
+- **`guiding_start_step` -> `sampler_restart_step`, `guiding_end_step` ->
+  `sampling_end_step`.** Neither ever windowed a guide, and the old names said
+  they did. A guide is not a per-step influence: `_add_latent_guide` APPENDS
+  latent frames and `keyframe_idxs`, structural for the whole chunk and cropped
+  off afterwards, so releasing it mid-schedule would mean changing the tensor's
+  shape between steps. The phase-2 guider cannot release it either — it is
+  deliberately given the chunk's full conditioning.
+
+  What they actually do: `sampling_end_step` TRUNCATES the sigma schedule
+  (set it to 4 and you get 4 steps, partially denoised); `sampler_restart_step`
+  splits the schedule and restarts the sampler, which changes no guidance and
+  discards multi-step sampler history (`etdrk2_2s`, `gauss-legendre_2s`).
+
+  **Saved workflows are unaffected** — both were renamed IN PLACE, so widget
+  positions (12 and 13 of 22) are unchanged and UI workflows deserialize
+  identically. API-format workflows passing the old names still work.
+
+  For structure-early / freedom-late, use two passes: a guided pass with
+  `sampling_end_step` at the cutoff, then a guide-free pass finishing from it.
+
+## 1.7.1 - 2026-07-31
+
+### Fixed
+- **Feeding a combined AV latent to `optional_guiding_latents` (or the
+  negative-index / normalizing inputs) now raises instead of corrupting
+  silently.** `NestedTensor.shape` reports the VIDEO tensor's shape, so frame
+  counts pass every check, but slicing propagates to BOTH tensors on the same
+  axis: `_select_video_frames`'s `[:, :, 0:5]` yielded 5 video latents and 5
+  AUDIO latents where ~40 were meant, then handed the result to
+  `append_keyframe`. Nothing raised. The error names `LTXVSeparateAVLatent` and
+  notes which inputs genuinely do take AV (`optional_prior_av_latent`, `latents`).
+
 ## 1.7.0 - 2026-07-30
 
 ### Added
