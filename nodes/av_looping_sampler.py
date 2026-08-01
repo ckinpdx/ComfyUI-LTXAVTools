@@ -82,6 +82,24 @@ def _select_video_frames(latent_dict, start, end):
     return s
 
 
+def _reject_av_latent(latent_dict, name):
+    """These inputs take a VIDEO latent. An AV latent passes every duck-typed
+    check and corrupts silently: NestedTensor.shape reports the VIDEO shape, so
+    frame counts look right, but slicing propagates to BOTH tensors on the same
+    axis — `[:, :, 0:5]` yields 5 video latents and 5 AUDIO latents where ~40
+    were meant. Nothing raises. Catch it here, where we can name the fix."""
+    if latent_dict is None:
+        return
+    if isinstance(latent_dict.get("samples"), NestedTensor):
+        raise ValueError(
+            f"[LTXVAVLoopingSampler] {name} received a combined AV latent, but it "
+            f"takes a VIDEO latent. Slicing an AV latent cuts the audio on the "
+            f"VIDEO frame axis, silently truncating it to the video frame count. "
+            f"Split it with LTXVSeparateAVLatent and wire the video_latent output. "
+            f"(optional_prior_av_latent and the main `latents` input DO take AV.)"
+        )
+
+
 def _apply_adain(video_out, adain_ref, factor, per_frame=False):
     """
     Normalize video_out channel statistics to match adain_ref, then lerp.
@@ -261,15 +279,25 @@ class LTXVAVLoopingSampler:
                     "tooltip": "Blends each chunk's output toward the AdaIN reference's "
                                "per-channel statistics. 0 disables.",
                 }),
-                "guiding_start_step": ("INT", {
+                "sampling_start_step": ("INT", {
                     "default": 0, "min": 0, "max": 1000,
-                    "tooltip": "First schedule step where optional_guiding_latents "
-                               "are applied.",
+                    "tooltip": "Begin at this step, skipping the ones before it \u2014 the "
+                               "incoming latent is re-noised to that sigma and finished "
+                               "from there. Same slice as core SplitSigmas' second "
+                               "output (sigmas[step:]). Use it to continue a partial "
+                               "pass: set sampling_end_step N on pass 1 and "
+                               "sampling_start_step N on pass 2. 0 = start at the "
+                               "beginning. Step numbers are ABSOLUTE indices into the "
+                               "incoming schedule.",
                 }),
-                "guiding_end_step": ("INT", {
+                "sampling_end_step": ("INT", {
                     "default": 1000, "min": 0, "max": 1000,
-                    "tooltip": "Last schedule step where optional_guiding_latents "
-                               "are applied.",
+                    "tooltip": "Stop after this step; later ones are DISCARDED, leaving a "
+                               "partially denoised latent. Same slice as core SplitSigmas' "
+                               "first output (sigmas[:step+1]). Pairs with "
+                               "sampling_start_step to window the schedule without wiring "
+                               "SplitSigmas. Not a guide control \u2014 guides cannot be "
+                               "windowed. Step numbers are ABSOLUTE.",
                 }),
                 "optional_cond_image_indices": ("STRING", {
                     "default": "0",
@@ -533,22 +561,63 @@ class LTXVAVLoopingSampler:
         video_init["noise_mask"] = merged
 
     def _run_sampling(self, noise, guider, sampler, sigmas,
-                      av_init, guiding_start_step, guiding_end_step,
+                      av_init, sampling_start_step, sampling_end_step,
                       phase2_sampler=None, phase2_guider=None, phase2_start_step=0):
         """
         Run the schedule as sequential resample-continuation segments.
-        Split points: guiding_start_step (guide windowing) and, when a phase-2
-        sampler is provided, phase2_start_step — where the sampler/guider pair
-        switches (dual-sampler schedules a la Clownshark chain, resample mode).
-        Steps beyond guiding_end_step are discarded (pre-existing behavior).
-        """
-        use_phase2 = phase2_sampler is not None and phase2_start_step > 0
-        end_step = guiding_end_step
 
-        cut_points = {guiding_start_step}
-        if use_phase2:
-            cut_points.add(phase2_start_step)
-        cut_points = sorted(p for p in cut_points if 0 < p < end_step)
+        NOTHING HERE WINDOWS A GUIDE, despite what the old parameter names
+        (guiding_start_step / guiding_end_step) implied. A guide is not a
+        per-step influence: _add_latent_guide APPENDS latent frames and
+        keyframe_idxs, so it is structural for the whole chunk and is cropped
+        off afterwards. Releasing it mid-schedule would mean changing the
+        tensor's shape between steps, which is not expressible — and the
+        phase-2 guider is deliberately given this chunk's FULL conditioning
+        (see _sample_first_chunk) so it cannot release it either. To drop a
+        guide you need a genuinely separate pass whose conditioning never had
+        it added.
+
+        sampling_start_step / sampling_end_step WINDOW THE SCHEDULE, using core
+        SplitSigmas' own slicing (first output sigmas[:step+1], second output
+        sigmas[step:], sharing the boundary sigma). Start skips the steps before
+        it, re-noising the incoming latent to that sigma; end discards the ones
+        after, leaving a partially denoised latent. Both are ABSOLUTE indices
+        into the incoming schedule, so pass 1 `end N` hands off to pass 2
+        `start N` with no arithmetic on the user's part.
+
+        The remaining split point is phase2_start_step, where the
+        sampler/guider pair switches (dual-sampler schedules a la Clownshark
+        chain, resample mode). It is rebased onto the sliced schedule.
+        """
+        # Step numbers are ABSOLUTE indices into the incoming schedule. Slice the
+        # head off exactly as core's SplitSigmas does — its second output is
+        # sigmas[step:], sharing the boundary sigma with the first — then rebase
+        # the remaining split points onto the sliced schedule.
+        start = max(0, sampling_start_step)
+        if start > 0:
+            if sampling_end_step <= start:
+                raise ValueError(
+                    f"[LTXVAVLoopingSampler] sampling_start_step ({start}) must be "
+                    f"below sampling_end_step ({sampling_end_step}) — that window "
+                    f"contains no steps. These are absolute indices into the sigma "
+                    f"schedule: start skips the steps before it, end drops the ones "
+                    f"after."
+                )
+            _, sigmas = SplitSigmas().get_sigmas(sigmas, start)
+            if len(sigmas) <= 1:
+                raise ValueError(
+                    f"[LTXVAVLoopingSampler] sampling_start_step {start} is at or past "
+                    f"the end of the sigma schedule — nothing left to sample. Lower "
+                    f"it, or give the scheduler more steps."
+                )
+
+        use_phase2 = phase2_sampler is not None and phase2_start_step > 0
+        phase2_local = phase2_start_step - start
+        end_step = sampling_end_step - start
+
+        cut_points = sorted(
+            p for p in ({phase2_local} if use_phase2 else set()) if 0 < p < end_step
+        )
 
         segments = []
         remaining = sigmas
@@ -565,7 +634,7 @@ class LTXVAVLoopingSampler:
             if len(seg_sigmas) <= 1:
                 continue
             seg_sampler, seg_guider = sampler, guider
-            if use_phase2 and seg_start >= phase2_start_step:
+            if use_phase2 and seg_start >= phase2_local:
                 seg_sampler = phase2_sampler
                 seg_guider  = phase2_guider if phase2_guider is not None else guider
             _, current = SamplerCustomAdvanced().sample(
@@ -859,7 +928,7 @@ class LTXVAVLoopingSampler:
         tile_h, tile_w, temporal_tile_size, fps,
         cond_images, cond_image_strength,
         neg_idx_latents, neg_idx, neg_idx_strength,
-        guiding_start_step, guiding_end_step,
+        sampling_start_step, sampling_end_step,
         guiding_latents, guiding_strength,
         keyframes, kf_idx_str,
         audio_cond_strength=0.0,
@@ -1010,7 +1079,7 @@ class LTXVAVLoopingSampler:
             phase2_guider = copy.copy(phase2_guider)
             phase2_guider.set_conds(positive, negative)
         av_out = self._run_sampling(noise, guider, sampler, sigmas, av_init,
-                                    guiding_start_step, guiding_end_step,
+                                    sampling_start_step, sampling_end_step,
                                     phase2_sampler=phase2_sampler,
                                     phase2_guider=phase2_guider,
                                     phase2_start_step=phase2_start_step)
@@ -1037,7 +1106,7 @@ class LTXVAVLoopingSampler:
         overlap_cond_strength,
         audio_overlap_cond_strength,
         neg_idx_latents, neg_idx, neg_idx_strength,
-        guiding_start_step, guiding_end_step,
+        sampling_start_step, sampling_end_step,
         guiding_latents, guiding_strength,
         keyframes, kf_idx_str, cond_image_strength,
         chunk_index,
@@ -1290,7 +1359,7 @@ class LTXVAVLoopingSampler:
             phase2_guider = copy.copy(phase2_guider)
             phase2_guider.set_conds(positive, negative)
         av_out = self._run_sampling(noise, guider, sampler, sigmas, av_init,
-                                    guiding_start_step, guiding_end_step,
+                                    sampling_start_step, sampling_end_step,
                                     phase2_sampler=phase2_sampler,
                                     phase2_guider=phase2_guider,
                                     phase2_start_step=phase2_start_step)
@@ -1367,7 +1436,7 @@ class LTXVAVLoopingSampler:
         cond_images, cond_image_strength,
         neg_idx_latents, neg_idx, neg_idx_strength,
         optional_positive_conditionings,
-        guiding_start_step, guiding_end_step,
+        sampling_start_step, sampling_end_step,
         guiding_latents, guiding_strength,
         keyframe_per_tile_indices, optional_keyframes,
         first_seed, v, h, vert_tiles, horiz_tiles,
@@ -1442,7 +1511,7 @@ class LTXVAVLoopingSampler:
                 time_scale=time_scale, width_scale=width_scale, height_scale=height_scale,
                 tile_h=tile_h, tile_w=tile_w, fps=fps,
                 neg_idx_latents=neg_idx_latents, neg_idx=neg_idx, neg_idx_strength=neg_idx_strength,
-                guiding_start_step=guiding_start_step, guiding_end_step=guiding_end_step,
+                sampling_start_step=sampling_start_step, sampling_end_step=sampling_end_step,
                 guiding_latents=guiding_latents, guiding_strength=guiding_strength,
                 guiding_downscale_factor=guiding_downscale_factor,
                 keyframes=chunk_kf_images, kf_idx_str=kf_str,
@@ -1543,7 +1612,8 @@ class LTXVAVLoopingSampler:
         optional_negative_index_strength=1.0,
         optional_positive_conditionings=None,
         optional_normalizing_latents=None,
-        guiding_start_step=0, guiding_end_step=1000,
+        sampling_start_step=0, sampling_end_step=1000,
+        guiding_start_step=None, guiding_end_step=None,
         optional_cond_image_indices="0",
         scene_lengths="",
         per_tile_seed_offsets="0",
@@ -1590,6 +1660,22 @@ class LTXVAVLoopingSampler:
                   f"(1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 200). At {video_fps} "
                   f"expect up to ~20 ms of per-boundary quantization; it does not "
                   f"accumulate, but seams may drift against a conditioned track.")
+
+        # Renamed in 1.8.0 to say what they do. UI workflows serialize widgets
+        # POSITIONALLY so they carry over untouched; API-format workflows pass
+        # names, so the old ones are still honoured.
+        if guiding_start_step is not None:
+            # NOTE: meaning CHANGED in 1.9.0. The old widget split the schedule
+            # and restarted the sampler (no useful effect); this one SKIPS the
+            # steps before it. A stale non-zero value now shortens the run.
+            sampling_start_step = guiding_start_step
+        if guiding_end_step is not None:
+            sampling_end_step = guiding_end_step
+
+        # These three take VIDEO latents; an AV latent corrupts silently here.
+        _reject_av_latent(optional_guiding_latents, "optional_guiding_latents")
+        _reject_av_latent(optional_negative_index_latents, "optional_negative_index_latents")
+        _reject_av_latent(optional_normalizing_latents, "optional_normalizing_latents")
 
         # A short input audio track is silent at render time: chunks pad it with
         # zeros, and a zero audio latent is OOD — it decodes to a hum, not
@@ -1898,8 +1984,8 @@ class LTXVAVLoopingSampler:
                     neg_idx=neg_idx,
                     neg_idx_strength=optional_negative_index_strength,
                     optional_positive_conditionings=optional_positive_conditionings,
-                    guiding_start_step=guiding_start_step,
-                    guiding_end_step=guiding_end_step,
+                    sampling_start_step=sampling_start_step,
+                    sampling_end_step=sampling_end_step,
                     guiding_latents=tile_guide,
                     guiding_strength=guiding_strength,
                     keyframe_per_tile_indices=kf_per_tile,

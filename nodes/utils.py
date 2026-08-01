@@ -313,6 +313,41 @@ class LTXAudioLatentPad:
         return (out,)
 
 
+def _unwrap_upscale_model(upscale_model):
+    """LATENT_UPSCALE_MODEL is a bare nn.Module on ComfyUI <= 0.28 and a
+    ModelPatcherDynamic from 0.29.0 ("Latent upsampler model converted to
+    ModelPatcherDynamic", PR #15063). The patcher has no .parameters(), no
+    .to()/.cpu() in the nn.Module sense, and is not callable, so every call
+    site below would fail on 0.29.
+
+    Returns (module, patcher_or_None). When a patcher is present, let
+    ComfyUI's loader move the weights instead of doing it by hand — manual
+    .to()/.cpu() on a patched module fights its memory management.
+    """
+    inner = getattr(upscale_model, "model", None)
+    if inner is not None and hasattr(inner, "parameters"):
+        return inner, upscale_model
+    return upscale_model, None
+
+
+def _load_upscale_model(module, patcher, device):
+    if patcher is not None:
+        try:
+            model_management.load_model_gpu(patcher)
+            return
+        except Exception as e:
+            print(f"[LTXVLatentUpsampler] load_model_gpu failed ({e}); "
+                  f"falling back to a manual device move.")
+    module.to(device)
+
+
+def _unload_upscale_model(module, patcher):
+    # With a patcher, ComfyUI owns eviction; forcing .cpu() desyncs its
+    # bookkeeping. Without one, we moved it, so we move it back.
+    if patcher is None:
+        module.cpu()
+
+
 class LTXVAVLatentUpsampler:
     """
     AV-aware wrapper around the LTX latent upscale model with CPU fallback.
@@ -351,25 +386,27 @@ class LTXVAVLatentUpsampler:
             video = raw
             audio = None
 
+        up_module, up_patcher = _unwrap_upscale_model(upscale_model)
+
         stats       = vae.first_stage_model.per_channel_statistics
-        model_dtype = next(upscale_model.parameters()).dtype
+        model_dtype = next(up_module.parameters()).dtype
         input_dtype = video.dtype
 
         video_un = stats.un_normalize(video).to(dtype=model_dtype)
         print(f"[LTXVLatentUpsamplerTiled] input {tuple(video_un.shape)}")
 
         device = model_management.get_torch_device()
-        upscale_model.to(device)
+        _load_upscale_model(up_module, up_patcher, device)
         try:
-            upsampled = upscale_model(video_un.to(device))
+            upsampled = up_module(video_un.to(device))
         except torch.cuda.OutOfMemoryError:
             print(
                 "[LTXVLatentUpsamplerTiled] GPU OOM — retrying on CPU (this will be slow)."
             )
-            upscale_model.cpu()
-            upsampled = upscale_model(video_un.cpu())
+            up_module.cpu()
+            upsampled = up_module(video_un.cpu())
         finally:
-            upscale_model.cpu()
+            _unload_upscale_model(up_module, up_patcher)
 
         upsampled = stats.normalize(upsampled).to(
             dtype=input_dtype,
@@ -444,8 +481,10 @@ class LTXVAVLatentUpsamplerTiled:
             video = raw
             audio = None
 
+        up_module, up_patcher = _unwrap_upscale_model(upscale_model)
+
         stats       = vae.first_stage_model.per_channel_statistics
-        model_dtype = next(upscale_model.parameters()).dtype
+        model_dtype = next(up_module.parameters()).dtype
         input_dtype = video.dtype
         inter_dev   = model_management.intermediate_device()
         gpu_dev     = model_management.get_torch_device()
@@ -458,7 +497,7 @@ class LTXVAVLatentUpsamplerTiled:
         temporal_mode  = None   # auto-detected from the first tile's output shape
         T_out          = None
 
-        upscale_model.to(gpu_dev)
+        _load_upscale_model(up_module, up_patcher, gpu_dev)
         try:
             t_start = 0
             while t_start < T:
@@ -467,7 +506,7 @@ class LTXVAVLatentUpsamplerTiled:
                 L      = t_end - t_start
 
                 tile_un  = stats.un_normalize(tile_v).to(dtype=model_dtype, device=gpu_dev)
-                up_tile  = upscale_model(tile_un)
+                up_tile  = up_module(tile_un)
                 up_tile  = stats.normalize(up_tile).to(dtype=input_dtype, device=inter_dev)
 
                 # Mode detection (SPEC_TILED_TEMPORAL.md): spatial upscalers keep
@@ -569,7 +608,7 @@ class LTXVAVLatentUpsamplerTiled:
                     break
                 t_start += step
         finally:
-            upscale_model.cpu()
+            _unload_upscale_model(up_module, up_patcher)
 
         result = result / (result_weights + 1e-8)
 
