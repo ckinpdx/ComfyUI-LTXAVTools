@@ -1,5 +1,105 @@
 # Changelog
 
+## 1.11.2 - 2026-08-01
+
+### Fixed
+- **Sample previews were unreadable.** 1.11.0 hard-coded
+  `sample_sampling_preset = "distilled_two_stage"`, on the reasoning that
+  previews should resemble the two-stage distilled pipeline the LoRA will
+  actually be used with. Wrong: that preset samples in ~8 steps and only works
+  when a distilled LoRA is loaded, and the TRAINER runs the raw dev checkpoint
+  with no such LoRA. Eight-step distilled sampling on a non-distilled model
+  produces mush, so there was nothing to judge.
+
+  Now emits `sample_sampling_preset = "defaults"`, which resolves to the
+  LTX-2.3 preset (30 steps, CFG/STG defaults, CFG rescale 0.7).
+
+  Note the cost: 30 steps per prompt is roughly four times the old setting.
+  Match `sample_every_n_steps` and the number of prompts to that, or sampling
+  can take longer than the training interval between samples.
+
+## 1.11.1 - 2026-08-01
+
+### Fixed
+- **`TypeError: _LTXLoraTrainBase.run() got an unexpected keyword argument
+  'sample_prompts'`** — 1.11.0 forwarded the sampling widgets from the character
+  node's `run()` to the base `run()`, which had neither those parameters nor
+  `**kwargs`. Every character training run failed immediately.
+
+  The base now takes them as explicit parameters (with defaults, so workflows
+  saved before 1.11.0 still work) plus `**kwargs`, so a future appended widget
+  cannot break the signature the same way.
+
+  The audio node was unaffected — it does not delegate to the base and reads its
+  widgets from its own `**kwargs`.
+
+  Cause worth recording: the widgets were verified present on both node classes
+  and the call site was verified by source inspection, but the BASE class's
+  signature was never checked, and inspection cannot catch an arity mismatch.
+  A call-signature test would have.
+
+## 1.11.0 - 2026-08-01
+
+### Added
+- **Sampling during training** on both LoRA training nodes. Three widgets,
+  appended last so widget indices for every existing setting are unchanged:
+  `sample_prompts` (pipe-separated, matching the rest of the pack),
+  `sample_every_n_steps` (0 = off), `sample_at_first`.
+
+  LTX's own guidance is to stop training on generated SAMPLES rather than on
+  loss, and to keep every checkpoint so one can be picked afterwards. Neither
+  was possible before: the nodes saved once, at the end, and showed nothing.
+
+  `sample_at_first` is on by default. It renders the prompts BEFORE any
+  training, giving a step-0 baseline — without it there is no way to separate
+  what the LoRA changed from what the base model already did, which is most of
+  what makes sample-watching useless.
+
+  Prompts are written to `config/sampling_prompts.txt`, one per line. Two
+  settings are fixed rather than exposed: `sample_with_offloading` (22B plus
+  training state plus a sampling pass will OOM on 32GB otherwise) and
+  `sample_sampling_preset = "distilled_two_stage"`, so previews resemble the
+  two-stage pipeline they will actually be generated with. The node warns when
+  a prompt has no fixed seed (`--d N`) — without one, differences between
+  checkpoints are partly noise and cannot be read as improvement.
+
+  The audio node emits `sample_audio_only = true`; generating full video to
+  judge a voice is wasted compute. The video node emits `sample_merge_audio`.
+
+  Sample prompts should mirror the CAPTION format the LoRA was trained on —
+  same word order, same emotion vocabulary, quoted speech last — or the LoRA
+  will not recognise what it is being asked for.
+
+### Notes
+- Requires musubi-tuner with LTX-2 support (AkaneTendo25 fork). Verified
+  against 0.3.4; the flags used (`sample_prompts`, `sample_every_n_steps`,
+  `sample_at_first`, `sample_audio_only`, `sample_merge_audio`,
+  `sample_with_offloading`, `sample_sampling_preset`) are all present there.
+
+## 1.10.0 - 2026-08-01
+
+### Fixed
+- **LoRA training now responds to ComfyUI's Cancel button.** `_run_command`
+  iterated `for line in process.stdout`, which blocks until the next line
+  arrives, and never consulted ComfyUI's interrupt flag. Cancel unwound
+  ComfyUI's own execution loop while musubi carried on training — still on the
+  GPU, still writing to the log.
+
+  Output is now read on a thread and the main loop polls
+  `model_management.processing_interrupted()` every 250 ms, so a cancel lands
+  even during the long silent stretches between epochs (exactly when someone
+  presses it).
+
+  **The whole process TREE is killed, not just the child.** musubi runs under
+  `accelerate`, which spawns workers; terminating only the direct child orphans
+  them and they keep the GPU pinned. Windows uses `taskkill /F /T`, POSIX the
+  process group. Verified against a parent+worker pair: both gone after the
+  kill. If the tree kill fails it says so and names the symptom, rather than
+  reporting a clean cancel over live orphans.
+
+  The node raises `InterruptProcessingException`, so the queue shows a cancel
+  rather than a node failure. Checkpoints already written are kept.
+
 ## 1.9.1 - 2026-07-31
 
 ### Fixed
