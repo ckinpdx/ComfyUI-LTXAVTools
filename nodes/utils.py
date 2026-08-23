@@ -783,6 +783,44 @@ class LTXLoraMetadataReader:
         return (path, factor, meta_str, int(round(factor)))
 
 
+def write_ffmetadata(path, tags):
+    """An ffmetadata1 file for `-f ffmetadata -i path`.
+
+    A workflow JSON runs 45-95 KB. Windows caps a command line near 32,767
+    characters, so `-metadata workflow=...` cannot carry one -- the file form is
+    not a tidiness choice, it is the only form that fits.
+
+    ffmpeg's escapes are = ; # \\ and newline; everything else is literal, and
+    the file is UTF-8 so emoji in node titles survive.
+    """
+    out = [";FFMETADATA1"]
+    for key, value in tags.items():
+        value = (value.replace("\\", "\\\\").replace("=", "\\=")
+                      .replace(";", "\\;").replace("#", "\\#")
+                      .replace("\n", "\\\n"))
+        out.append("%s=%s" % (key, value))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("\n".join(out) + "\n")
+
+
+def collect_metadata(prompt, extra_pnginfo):
+    """ComfyUI's saved-workflow tags, or {} when metadata is disabled."""
+    import json
+    try:
+        from comfy.cli_args import args
+        if args.disable_metadata:
+            return {}
+    except Exception:
+        pass
+    tags = {}
+    if prompt is not None:
+        tags["prompt"] = json.dumps(prompt)
+    if extra_pnginfo is not None:
+        for k, v in extra_pnginfo.items():
+            tags[k] = json.dumps(v)      # "workflow" is the one that drag-drops
+    return tags
+
+
 class LTXAVStreamingSave:
     """
     Chunked VAE decode streamed straight into ffmpeg — the full pixel tensor
@@ -851,6 +889,23 @@ class LTXAVStreamingSave:
                                "working H.264 encoder (a PATH ffmpeg built "
                                "without libx264 is the usual culprit).",
                 }),
+                "save_metadata": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Embed the workflow and prompt in the mp4, so "
+                               "dragging the file back into ComfyUI restores "
+                               "the graph. Written as an ffmetadata file rather "
+                               "than a command-line argument: a workflow is "
+                               "45-95 KB and Windows caps a command line near "
+                               "32,767 characters.\n\n"
+                               "Turn OFF for files you are sending out - the "
+                               "workflow carries every prompt and path in the "
+                               "graph. ComfyUI's --disable-metadata also wins "
+                               "over this.",
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
             },
         }
 
@@ -960,7 +1015,8 @@ class LTXAVStreamingSave:
 
     def stream_save(self, latent, vae, chunk_latents, context_latents, fps,
                     filename_prefix, crf, optional_audio=None,
-                    video_encoder="auto", ffmpeg_path=""):
+                    video_encoder="auto", ffmpeg_path="", save_metadata=True,
+                    prompt=None, extra_pnginfo=None):
         import os
         import shutil
         import subprocess
@@ -992,6 +1048,20 @@ class LTXAVStreamingSave:
         final_path = os.path.join(full_folder, f"{fname}_{counter:05}.mp4")
 
         import tempfile
+
+        # Attached to the FIRST pass so both endings inherit it: the silent path's
+        # os.replace keeps the file as-is, and the audio mux carries the tags
+        # through -c:v copy.
+        meta_tmp = None
+        meta_args = []
+        if save_metadata:
+            tags = collect_metadata(prompt, extra_pnginfo)
+            if tags:
+                meta_tmp = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.ffmeta")
+                write_ffmetadata(meta_tmp, tags)
+                meta_args = ["-f", "ffmetadata", "-i", meta_tmp,
+                             "-map", "0:v", "-map_metadata", "1",
+                             "-movflags", "use_metadata_tags"]
 
         proc = None
         frames_written = 0
@@ -1039,6 +1109,7 @@ class LTXAVStreamingSave:
                         [ffmpeg, "-y", "-loglevel", "error",
                          "-f", "rawvideo", "-pix_fmt", "rgb24",
                          "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:"]
+                        + meta_args
                         + self._encoder_args(encoder, crf, W, H)
                         + [video_tmp],
                         stdin=subprocess.PIPE,
@@ -1109,7 +1180,9 @@ class LTXAVStreamingSave:
                      "-f", "f32le", "-ar", str(int(optional_audio["sample_rate"])),
                      "-ac", str(channels), "-i", pcm_tmp,
                      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                     "-shortest", final_path],
+                     "-shortest"]
+                    + (["-movflags", "use_metadata_tags"] if meta_args else [])
+                    + [final_path],
                     stderr=subprocess.PIPE,
                 )
                 if mux.returncode != 0:
@@ -1131,6 +1204,12 @@ class LTXAVStreamingSave:
             os.remove(video_tmp)
         else:
             os.replace(video_tmp, final_path)
+
+        if meta_tmp is not None:
+            try:
+                os.remove(meta_tmp)
+            except OSError:
+                pass
 
         print(f"[LTXAVStreamingSave] {frames_written} frames "
               f"({frames_written / fps:.2f}s) -> {final_path}")

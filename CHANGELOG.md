@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.13.0 - 2026-08-23
+
+### Added
+
+- **`LTXAVStreamingSave`: `save_metadata` (append-only, added LAST), default on.**
+  Embeds the workflow and prompt in the mp4 so the file drags back into ComfyUI. The
+  node declared no `hidden` inputs, so it never saw either.
+
+  The tags go in an **ffmetadata file**, not a command-line argument: a real workflow
+  is 45–95 KB and Windows caps a command line near 32,767 characters. mp4/isobmff also
+  drops unknown tags without `-movflags use_metadata_tags`, which is why core sets the
+  same flag — without it `workflow` and `prompt` vanish with no error.
+
+  Metadata attaches to the first pass, so the silent path's `os.replace` keeps it and
+  the audio mux carries it through `-c:v copy`. `faststart` is deliberately not used:
+  relocating the moov atom rewrites the whole file, undoing the constant-RAM export
+  this node exists for. ComfyUI's `--disable-metadata` wins over the widget.
+
+  Same change as MMH3Tools 0.79.0.
+
 ## 1.12.0 - 2026-08-11
 
 ### Added
