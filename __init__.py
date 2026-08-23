@@ -14,9 +14,10 @@ from .nodes.video_cut_marker import NODE_CLASS_MAPPINGS as _VCMCM, NODE_DISPLAY_
 from .nodes.ic_reference import NODE_CLASS_MAPPINGS as _ICRCM, NODE_DISPLAY_NAME_MAPPINGS as _ICRDM
 from .nodes.ic_reference_multi import NODE_CLASS_MAPPINGS as _ICMCM, NODE_DISPLAY_NAME_MAPPINGS as _ICMDM
 from .nodes.clip_join import NODE_CLASS_MAPPINGS as _CJCM, NODE_DISPLAY_NAME_MAPPINGS as _CJDM
+from .nodes.keyframe_marker import NODE_CLASS_MAPPINGS as _KMCM, NODE_DISPLAY_NAME_MAPPINGS as _KMDM
 
-NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM, **_CDPCM, **_SRCM, **_CATCM, **_RABCM, **_VCMCM, **_ICRCM, **_ICMCM, **_CJCM}
-NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM, **_CDPDM, **_SRDM, **_CATDM, **_VCMDM, **_RABDM, **_ICRDM, **_ICMDM, **_CJDM}
+NODE_CLASS_MAPPINGS        = {**_ACM, **_CCM, **_AGM, **_SCM, **_SCCM, **_UCM, **_ALSCM, **_LTCM, **_CDPCM, **_SRCM, **_CATCM, **_RABCM, **_VCMCM, **_ICRCM, **_ICMCM, **_CJCM, **_KMCM}
+NODE_DISPLAY_NAME_MAPPINGS = {**_ADM, **_CDM, **_AGD, **_SDM, **_SCDM, **_UDM, **_ALSDM, **_LTDM, **_CDPDM, **_SRDM, **_CATDM, **_VCMDM, **_RABDM, **_ICRDM, **_ICMDM, **_CJDM, **_KMDM}
 
 WEB_DIRECTORY = "./web/js"
 

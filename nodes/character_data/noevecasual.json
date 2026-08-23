@@ -1,0 +1,16 @@
+{
+  "used": [
+    "front__eye_level__full_body",
+    "front__eye_level__three_quarter",
+    "front__eye_level__waist_up",
+    "front__eye_level__bust",
+    "front__eye_level__head_shoulders",
+    "front__eye_level__face_closeup",
+    "front__low_angle__full_body",
+    "front__low_angle__three_quarter",
+    "front__low_angle__waist_up"
+  ],
+  "total_generated": 9,
+  "last_view": "front__low_angle__waist_up",
+  "last_run": "2026-05-16T10:22:07.103428"
+}

@@ -238,6 +238,24 @@ much less — every chunk, including 0, hears clean audio from the first step.)
   Latent`, which outputs the right index).
 - Negative indices count from the end (`"0,-1"` = first and last frame).
 
+**Index 0 is not conditioning — it is content.** The two bullets above describe two
+genuinely different mechanisms, and the distinction matters when a keyframe is ignored.
+Index 0 is `vae.encode`d and written straight into `video_init["samples"]` with a noise
+mask, so it cannot fail to be respected: it *is* the starting latent. Every other index
+goes through `LTXVAddGuide` and becomes an appended guide token that the model is free to
+weight as it likes. So "the first image landed and the later one didn't" is not
+necessarily a routing bug — the first one was never being honoured, it was installed.
+
+**Observed (2026-08-11), LTX 2.5:** a single-chunk run with indices `"0,-1"` respected the
+opening image but not the closing one. On 2.5 only, appended guide tokens are also
+explicitly denied the model's learned keyframe position embedding (`keyframes_abs_pos_mask`
+clears `mask[:, -num_guide_tokens:]`), while index 0 receives it for free by virtue of
+living in latent frame 0. Whether that missing marker is the *cause* of the weak late
+keyframe is unconfirmed — use `LTX AV Keyframe Marker (2.5)` to A/B it. Before reaching
+for the model, rule out the cheaper explanation: the planner derives indices from
+`scene_lengths` alone while the sampler clamps `chunk_schedule` to its own frame count,
+and `_calculate_keyframe_per_tile_indices` silently drops any index `>= total_px`.
+
 ### `optional_negative_index_latents` + `optional_negative_index_strength`
 
 Reference latents placed *before t = 0*, re-applied in **every** chunk. Two things to

@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.12.0 - 2026-08-11
+
+### Added
+- **LTX AV Keyframe Marker (2.5)** — a new node that adds LTX 2.5's learned
+  `keyframes_abs_pos_embedding` to appended guide tokens, which the model's own
+  mask excludes.
+
+  LTX 2.5 introduced a parameter the model adds to tokens encoding a single
+  standalone pixel frame. The mask that selects them
+  (`comfy/ldm/lightricks/model.py`, `keyframes_abs_pos_mask`) marks the main
+  sequence's first latent frame and any `generated_keyframes` slots, then
+  clears every appended guide token:
+
+      mask = temporal_start == 0
+      if num_guide_tokens > 0:
+          mask[:, -num_guide_tokens:] = False
+
+  This matters here because the looping sampler treats a keyframe at index 0
+  differently from every other index. Index 0 is written straight into the
+  latent with a noise mask (`_sample_first_chunk`), so it lands on a token the
+  mask *does* select and is marked for free. Every other index goes through
+  `LTXVAddGuide` and arrives as an appended guide token, which is never marked.
+
+  Modes: `off` (default, no patch applied), `single_frame_guides` (marks only
+  guide tokens whose temporal extent is one pixel frame — image keyframes —
+  leaving IC-LoRA references and overlap carries alone), and `all_guides`.
+
+  Implemented with `ModelPatcher.add_object_patch`, so it is scoped to the
+  cloned MODEL and reverted on unpatch; no ComfyUI core file is modified. The
+  patch wraps the original bound method rather than reimplementing it, so the
+  `generated_keyframes` branch and the tokens-per-frame validation are
+  untouched.
+
+  Inert on LTX 2.3 and earlier in every mode: those checkpoints have no
+  `keyframes_abs_pos_embedding`, and `apply_keyframes_abs_pos_embedding`
+  returns before the patched function is reached. Safe to leave wired in a
+  graph that runs against both.
+
 ## 1.11.2 - 2026-08-01
 
 ### Fixed

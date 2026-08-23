@@ -387,6 +387,29 @@ Switches the LTX2.3 AV model's cross-modal attention couplings on/off via `trans
 
 ---
 
+### LTX AV Keyframe Marker (2.5)
+Adds LTX 2.5's learned `keyframes_abs_pos_embedding` to appended guide tokens. Takes a `MODEL`, returns a patched clone (source untouched) via `ModelPatcher.add_object_patch` — no ComfyUI core file is modified, and the patch reverts on unpatch. Wire it on the model line before the sampler.
+
+LTX 2.5 adds this parameter to the tokens that encode a single standalone pixel frame. The mask selecting them (`comfy/ldm/lightricks/model.py`, `keyframes_abs_pos_mask`) marks the main sequence's first latent frame plus any `generated_keyframes` slots, then clears every appended guide token:
+
+```python
+mask = temporal_start == 0
+if num_guide_tokens > 0:
+    mask[:, -num_guide_tokens:] = False
+```
+
+An image keyframe placed with `LTXVAddGuide` at a non-zero frame index arrives as an appended guide token, so it is never marked. A keyframe at index 0 is a different case — the AV Looping Sampler writes it directly into latent frame 0 with a noise mask rather than appending it, so it lands on a token the mask *does* select and is marked for free.
+
+| Input | Default | Description |
+|---|---|---|
+| `mode` | `off` | `off` — no patch applied, model returned unchanged. `single_frame_guides` — marks appended guide tokens whose temporal extent is one pixel frame (image keyframes), leaving multi-frame guides such as IC-LoRA references and overlap carries unmarked. `all_guides` — marks every appended guide token regardless of extent. |
+
+**No effect on LTX 2.3 and earlier** in any mode: those checkpoints have no `keyframes_abs_pos_embedding`, and `apply_keyframes_abs_pos_embedding` returns before the patched function is reached. Safe to leave wired in a graph you run against both.
+
+**Observed (2026-08-11):** on LTX 2.5, a single-chunk run with keyframes at index 0 and the planner's end index respected the first image but not the last. The index-0/appended split above is a mechanical explanation for the asymmetry — index 0 is installed in the latent rather than honoured as conditioning — but whether the missing marker is what weakens the appended keyframe is not yet confirmed. This node exists to A/B that: flip `single_frame_guides` on and off against an otherwise identical graph.
+
+---
+
 ### LTX Distilled Sigmas
 Generates a sigma schedule for **distilled or heavily distill-LoRA weighted LTX models** using a high-cluster + cliff + power-tail structure. Not suitable for full dev model runs. Concentrates steps near sigma=1.0, then uses a single large cliff step exploiting the distilled model's learned shortcut, followed by a power-curve tail to zero.
 
