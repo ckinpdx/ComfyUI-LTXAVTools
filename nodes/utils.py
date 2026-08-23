@@ -1088,16 +1088,26 @@ class LTXAVStreamingSave:
             err_file.close()
 
         if optional_audio is not None and optional_audio.get("waveform") is not None:
-            import torchaudio
-            wav_tmp = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.wav")
+            # RAW PCM, not torchaudio.save: since torchaudio 2.9 that call routes through
+            # TorchCodec, which ComfyUI does not require and which fails to load its
+            # FFmpeg DLLs on many Windows installs -- a hard error on a machine that has
+            # a perfectly good ffmpeg BINARY sitting right there. This function already
+            # spawns ffmpeg to write the video, so interleaved f32le needs no encoder
+            # library at all and cannot break when torchaudio next moves its backend.
+            pcm_tmp = os.path.join(full_folder, f"{fname}_{counter:05}_tmp.f32")
             wf = optional_audio["waveform"]
             if wf.ndim == 3:
-                wf = wf[0]
-            torchaudio.save(wav_tmp, wf.cpu(), int(optional_audio["sample_rate"]))
+                wf = wf[0]                      # [B,C,T] -- save one take, not a batch
+            wf = wf.detach().to(torch.float32).cpu()
+            channels = int(wf.shape[0])
+            # ffmpeg reads f32le interleaved: sample 0 of every channel, then sample 1.
+            wf.t().contiguous().numpy().tofile(pcm_tmp)
             try:
                 mux = subprocess.run(
                     [ffmpeg, "-y", "-loglevel", "error",
-                     "-i", video_tmp, "-i", wav_tmp,
+                     "-i", video_tmp,
+                     "-f", "f32le", "-ar", str(int(optional_audio["sample_rate"])),
+                     "-ac", str(channels), "-i", pcm_tmp,
                      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                      "-shortest", final_path],
                     stderr=subprocess.PIPE,
@@ -1115,7 +1125,7 @@ class LTXAVStreamingSave:
                 # wav_tmp is intermediate either way; video_tmp survives a mux
                 # failure on purpose (it's the user's silent fallback).
                 try:
-                    os.remove(wav_tmp)
+                    os.remove(pcm_tmp)
                 except OSError:
                     pass
             os.remove(video_tmp)

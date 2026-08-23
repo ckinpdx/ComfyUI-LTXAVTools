@@ -38,6 +38,22 @@
   returns before the patched function is reached. Safe to leave wired in a
   graph that runs against both.
 
+### Fixed
+
+- **`LTXAVStreamingSave` no longer needs torchaudio (or TorchCodec) to write audio.**
+  Since **torchaudio 2.9**, `torchaudio.save` routes through TorchCodec
+  unconditionally. TorchCodec is not a ComfyUI requirement, and where it *is* present
+  its Windows build frequently cannot load its FFmpeg DLLs — a hard failure at the
+  very end of a long render, on a machine with a working ffmpeg binary already there.
+
+  The node spawns that binary to write the video, so audio now uses the same door: the
+  waveform is written as raw interleaved `f32le` and handed to ffmpeg with
+  `-f f32le -ar <sr> -ac <ch>`. No encoder library is involved, so there is nothing to
+  install and nothing to break when torchaudio next moves its backend. Mono passes
+  through as `-ac 1` rather than being forced to stereo.
+
+  Same fix as MMH3Tools 0.78.1, which hit it first via a user report.
+
 ## 1.11.2 - 2026-08-01
 
 ### Fixed
